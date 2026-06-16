@@ -61,6 +61,28 @@ async function nukeLog(guild, msg) {
   if (id) guild.channels.cache.get(id)?.send(msg).catch(() => {});
 }
 
+// Helper: snapshot a single channel object into a plain object
+function snapshotChannel(ch) {
+  return {
+    id:               ch.id,
+    name:             ch.name,
+    type:             ch.type,
+    parentId:         ch.parentId         || null,
+    position:         ch.position,
+    topic:            ch.topic            || null,
+    nsfw:             ch.nsfw             || false,
+    rateLimitPerUser: ch.rateLimitPerUser || 0,
+    bitrate:          ch.bitrate          || null,
+    userLimit:        ch.userLimit        || null,
+    permissionOverwrites: ch.permissionOverwrites.cache.map(p => ({
+      id:    p.id,
+      type:  p.type,
+      allow: p.allow.bitfield.toString(),
+      deny:  p.deny.bitfield.toString(),
+    })),
+  };
+}
+
 // ─────────────────────────────────────────────
 //  READY
 // ─────────────────────────────────────────────
@@ -124,46 +146,45 @@ client.on('guildBanAdd', async ban => {
   } catch {}
 });
 
-// Save every deleted channel so we can restore it later
 client.on('channelDelete', async channel => {
   if (!channel.guild) return;
+  const { guild } = channel;
 
-  // ── Snapshot the channel ──────────────────────────────────────────
+  // ── Take a full guild snapshot at the START of each deletion wave ──
+  //
+  // WHY: If a nuker deletes the category first, channels inside it lose
+  // their parentId before the channelDelete event fires for them.
+  // By snapshotting the ENTIRE guild at the very first deletion, we
+  // capture all parentId relationships before anything is lost.
+  //
+  // The snapshot refreshes only after a 30-second gap (so rapid deletions
+  // during a nuke all use the same pre-nuke snapshot).
   try {
-    const snapshot = {
-      id:               channel.id,
-      name:             channel.name,
-      type:             channel.type,
-      parentId:         channel.parentId     || null,
-      position:         channel.position,
-      topic:            channel.topic        || null,
-      nsfw:             channel.nsfw         || false,
-      rateLimitPerUser: channel.rateLimitPerUser || 0,
-      bitrate:          channel.bitrate      || null,
-      userLimit:        channel.userLimit    || null,
-      deletedAt:        Date.now(),           // used to detect nuke start time
-      permissionOverwrites: channel.permissionOverwrites.cache.map(p => ({
-        id:    p.id,
-        type:  p.type,
-        allow: p.allow.bitfield.toString(),
-        deny:  p.deny.bitfield.toString(),
-      })),
-    };
+    const snapTimeKey = `snap.${guild.id}.time`;
+    const lastSnap    = await db.get(snapTimeKey);
 
-    const key   = `restorecache.${channel.guild.id}`;
-    const cache = (await db.get(key)) || [];
-    cache.unshift(snapshot);
-    await db.set(key, cache.slice(0, 100));
+    if (!lastSnap || Date.now() - lastSnap > 30_000) {
+      // Build a map of ALL channels currently in the guild.
+      // Also include the channel being deleted right now, since it's
+      // still accessible via the event parameter and still has its parentId.
+      const allChans = new Map(guild.channels.cache);
+      allChans.set(channel.id, channel); // ensure it's in there
+
+      const snap = [...allChans.values()].map(snapshotChannel);
+
+      await db.set(`snap.${guild.id}`, snap);
+      await db.set(snapTimeKey, Date.now());
+    }
   } catch {}
 
-  // ── Antinuke check ────────────────────────────────────────────────
+  // ── Antinuke threshold check ──────────────────────────────────────
   try {
-    const logs = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 1 });
+    const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 1 });
     const exec = logs.entries.first()?.executor;
-    if (!exec || exec.id === channel.guild.members.me?.id) return;
-    if (await trackAction(channel.guild, exec.id, 'channelDelete')) {
-      await nukeLog(channel.guild, `🚨 **Antinuke** — **${exec.tag}** hit the channel-delete limit. Punishing...`);
-      await punish(channel.guild, exec.id);
+    if (!exec || exec.id === guild.members.me?.id) return;
+    if (await trackAction(guild, exec.id, 'channelDelete')) {
+      await nukeLog(guild, `🚨 **Antinuke** — **${exec.tag}** hit the channel-delete limit. Punishing...`);
+      await punish(guild, exec.id);
     }
   } catch {}
 });
@@ -256,7 +277,7 @@ client.on('messageCreate', async message => {
               '`-antinuke whitelist add/remove @user`',
               '`-antinuke status`',
               '`-antinuke restore` — delete nuke channels & rebuild originals',
-              '`-antinuke restore clear` — clear the restore cache',
+              '`-antinuke restore clear` — clear the saved snapshot',
             ].join('\n'),
           },
         )
@@ -264,7 +285,7 @@ client.on('messageCreate', async message => {
     });
   }
 
-  // -ban @user [reason]
+  // -ban
   if (cmd === 'ban') {
     if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
       return message.reply('❌ You need **Ban Members** permission.');
@@ -288,7 +309,7 @@ client.on('messageCreate', async message => {
       ).setTimestamp()] });
   }
 
-  // -kick @user [reason]
+  // -kick
   else if (cmd === 'kick') {
     if (!message.member.permissions.has(PermissionFlagsBits.KickMembers))
       return message.reply('❌ You need **Kick Members** permission.');
@@ -312,7 +333,7 @@ client.on('messageCreate', async message => {
       ).setTimestamp()] });
   }
 
-  // -timeout @user <duration> [reason]
+  // -timeout
   else if (cmd === 'timeout' || cmd === 'mute') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
@@ -337,7 +358,7 @@ client.on('messageCreate', async message => {
       ).setTimestamp()] });
   }
 
-  // -warn @user <reason>
+  // -warn
   else if (cmd === 'warn') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
@@ -362,7 +383,7 @@ client.on('messageCreate', async message => {
       ).setTimestamp()] });
   }
 
-  // -warnings @user  /  -warnings clear @user
+  // -warnings
   else if (cmd === 'warnings' || cmd === 'warns') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
@@ -387,7 +408,7 @@ client.on('messageCreate', async message => {
       .setFooter({ text: `Total: ${list.length}` }).setTimestamp()] });
   }
 
-  // -purge <amount>  /  -purge @user <amount>
+  // -purge
   else if (cmd === 'purge' || cmd === 'clear') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages))
       return message.reply('❌ You need **Manage Messages** permission.');
@@ -406,7 +427,7 @@ client.on('messageCreate', async message => {
     setTimeout(() => confirm.delete().catch(() => {}), 4000);
   }
 
-  // -role add/remove @user <role name>
+  // -role
   else if (cmd === 'role') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
       return message.reply('❌ You need **Manage Roles** permission.');
@@ -571,60 +592,59 @@ client.on('messageCreate', async message => {
     }
 
     if (sub === 'status') {
-      const enabled = await db.get(`antinuke.${gid}.enabled`);
-      const wl      = (await db.get(`antinuke.${gid}.whitelist`)) || [];
-      const logCh   = await db.get(`antinuke.${gid}.logChannel`);
-      const cache   = (await db.get(`restorecache.${gid}`)) || [];
+      const enabled  = await db.get(`antinuke.${gid}.enabled`);
+      const wl       = (await db.get(`antinuke.${gid}.whitelist`)) || [];
+      const logCh    = await db.get(`antinuke.${gid}.logChannel`);
+      const snapTime = await db.get(`snap.${gid}.time`);
+      const snap     = (await db.get(`snap.${gid}`)) || [];
       return message.reply({ embeds: [new EmbedBuilder().setColor(enabled ? 0x00cc44 : 0xff4444)
         .setTitle('🛡️ Antinuke Status')
         .addFields(
           { name: 'Status',        value: enabled ? '✅ Enabled' : '❌ Disabled',                   inline: true },
           { name: 'Log Channel',   value: logCh ? `<#${logCh}>` : 'Not set',                       inline: true },
-          { name: 'Channel Cache', value: `${cache.length} saved`,                                  inline: true },
+          { name: 'Snapshot',      value: snapTime ? `${snap.length} channels saved • <t:${Math.floor(snapTime/1000)}:R>` : 'None yet', inline: false },
           { name: 'Whitelist',     value: wl.length ? wl.map(id => `<@${id}>`).join(', ') : 'None' },
         ).setTimestamp()] });
     }
 
     if (sub === 'restore') {
-      const cacheKey = `restorecache.${gid}`;
-
       // -antinuke restore clear
       if (args[1]?.toLowerCase() === 'clear') {
-        await db.delete(cacheKey);
-        return message.reply('✅ Channel restore cache cleared.');
+        await db.delete(`snap.${gid}`);
+        await db.delete(`snap.${gid}.time`);
+        return message.reply('✅ Restore snapshot cleared.');
       }
 
-      const cache = (await db.get(cacheKey)) || [];
-      if (!cache.length)
-        return message.reply('❌ No deleted channels in the cache. Channels are saved automatically whenever they are deleted.');
+      const snap     = await db.get(`snap.${gid}`);
+      const snapTime = await db.get(`snap.${gid}.time`);
 
-      // Work out when the nuke began — the earliest deletedAt in the cache.
-      // Any channel that was CREATED after that moment was made by the nuker.
-      const nukeStartTime = Math.min(...cache.map(c => c.deletedAt));
+      if (!snap || !snap.length)
+        return message.reply('❌ No snapshot found. A snapshot is taken automatically the first time a channel is deleted after a 30 second gap.');
 
-      const status = await message.reply(`⏳ Cleaning up nuke damage and restoring **${cache.length}** channel(s)…`);
+      const status = await message.reply(`⏳ Cleaning up nuke damage and restoring **${snap.length}** channel(s)…`);
 
-      let nukeDeleted = 0;
-      let restored    = 0;
-      let failed      = 0;
+      let nukeDeleted = 0, restored = 0, failed = 0;
 
       // ── Step 1: delete channels the nuker created ─────────────────
-      // These are any channels whose Discord creation timestamp is >= nukeStartTime
+      // Any channel whose Discord creation time is on or after the
+      // snapshot time was made AFTER (or during) the nuke.
       const nukeChannels = [...message.guild.channels.cache.values()]
-        .filter(ch => ch.createdTimestamp >= nukeStartTime);
+        .filter(ch => ch.createdTimestamp >= snapTime);
 
       for (const ch of nukeChannels) {
         await ch.delete('Antinuke restore: removing nuke-created channel').catch(() => {});
         nukeDeleted++;
       }
 
-      // Small pause so Discord can process the deletes before we recreate
+      // Brief pause so Discord processes the deletes
       await new Promise(r => setTimeout(r, 1500));
 
-      // ── Step 2: recreate categories first (type 4) ────────────────
-      const categoryMap = new Map(); // old channel ID → new channel ID
+      // ── Step 2: recreate categories (type 4) first ────────────────
+      // Map old category ID → newly created category ID so channels
+      // can be placed back into the correct category.
+      const categoryMap = new Map();
 
-      for (const ch of cache.filter(c => c.type === 4)) {
+      for (const ch of snap.filter(c => c.type === 4)) {
         try {
           const newCh = await message.guild.channels.create({
             name:     ch.name,
@@ -635,18 +655,17 @@ client.on('messageCreate', async message => {
               allow: BigInt(p.allow), deny: BigInt(p.deny),
             })),
           });
+          // Map the OLD category ID to the NEW one
           categoryMap.set(ch.id, newCh.id);
           restored++;
         } catch { failed++; }
       }
 
       // ── Step 3: recreate all other channels ───────────────────────
-      for (const ch of cache.filter(c => c.type !== 4)) {
+      for (const ch of snap.filter(c => c.type !== 4)) {
         try {
-          // If this channel was inside a category, map to the newly created one
-          const parentId = ch.parentId
-            ? (categoryMap.get(ch.parentId) || ch.parentId)
-            : null;
+          // Look up the newly created category using the old parentId
+          const parentId = ch.parentId ? categoryMap.get(ch.parentId) : null;
 
           const opts = {
             name:     ch.name,
@@ -678,7 +697,7 @@ client.on('messageCreate', async message => {
           { name: '✅ Channels restored',      value: String(restored),    inline: true },
           { name: '❌ Failed',                 value: String(failed),      inline: true },
         )
-        .setFooter({ text: 'Run -antinuke restore clear to wipe the cache.' })
+        .setFooter({ text: 'Run -antinuke restore clear to wipe the snapshot.' })
         .setTimestamp()] });
 
       return;
