@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "discord.js": "^14.15.3",
-    "quick.db": "^9.1.7"
+    "quick.db": "^9.1.7",
+    "better-sqlite3": "^9.4.3"
   }
 }
