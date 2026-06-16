@@ -5,8 +5,8 @@ const {
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
 
-const db     = new QuickDB();
-const client = new Client({
+const db      = new QuickDB();
+const client  = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
@@ -17,29 +17,29 @@ const client = new Client({
   partials: [Partials.GuildMember],
 });
 
-const PREFIX   = '-';
+const PREFIX    = '-';
 const restoring = new Set();
 
 // ─────────────────────────────────────────────
-//  SETTINGS CACHE  (avoids DB read on every event)
+//  SETTINGS CACHE
 // ─────────────────────────────────────────────
-const cache = new Map();
+const settCache = new Map();
 async function getSettings(gid) {
-  if (cache.has(gid)) return cache.get(gid);
+  if (settCache.has(gid)) return settCache.get(gid);
   const s = {
     enabled:    !!(await db.get(`antinuke.${gid}.enabled`)),
     whitelist:  (await db.get(`antinuke.${gid}.whitelist`)) || [],
     logChannel: await db.get(`antinuke.${gid}.logChannel`),
   };
-  cache.set(gid, s);
+  settCache.set(gid, s);
   return s;
 }
-function clearCache(gid) { cache.delete(gid); }
+function clearCache(gid) { settCache.delete(gid); }
 
 // ─────────────────────────────────────────────
-//  IN-MEMORY COUNTERS  (no DB, no await)
+//  IN-MEMORY COUNTERS
 // ─────────────────────────────────────────────
-const counts = { ch: new Map(), role: new Map(), ban: new Map(), kick: new Map() };
+const counters = { ch: new Map(), role: new Map(), ban: new Map(), kick: new Map() };
 
 function crossed(map, gid, window = 4000, limit = 2) {
   if (!map.has(gid)) map.set(gid, []);
@@ -52,24 +52,51 @@ function crossed(map, gid, window = 4000, limit = 2) {
 }
 
 // ─────────────────────────────────────────────
-//  AUDIT LOG PREFETCH  (starts on 1st event so
-//  result is ready when threshold fires on 2nd)
+//  AUDIT LOG PREFETCH
 // ─────────────────────────────────────────────
-const prefetched = new Map();
+const prefetchMap = new Map();
 function prefetch(guild, type) {
   const k = `${guild.id}:${type}`;
-  if (!prefetched.has(k)) {
-    prefetched.set(k, guild.fetchAuditLogs({ type, limit: 1 }).catch(() => null));
-    setTimeout(() => prefetched.delete(k), 5000);
+  if (!prefetchMap.has(k)) {
+    prefetchMap.set(k, guild.fetchAuditLogs({ type, limit: 1 }).catch(() => null));
+    setTimeout(() => prefetchMap.delete(k), 5000);
   }
-  return prefetched.get(k);
 }
 async function getExec(guild, type) {
+  const k = `${guild.id}:${type}`;
   const [pre, fresh] = await Promise.all([
-    prefetched.get(`${guild.id}:${type}`) || Promise.resolve(null),
+    prefetchMap.get(k) || Promise.resolve(null),
     guild.fetchAuditLogs({ type, limit: 1 }).catch(() => null),
   ]);
   return (fresh?.entries.first() || pre?.entries.first())?.executor || null;
+}
+
+// ─────────────────────────────────────────────
+//  SNAPSHOT HELPERS
+// ─────────────────────────────────────────────
+function snapCh(ch) {
+  return {
+    id: ch.id, name: ch.name, type: ch.type,
+    parentId: ch.parentId || null, position: ch.position,
+    topic: ch.topic || null, nsfw: ch.nsfw || false,
+    rateLimitPerUser: ch.rateLimitPerUser || 0,
+    bitrate: ch.bitrate || null, userLimit: ch.userLimit || null,
+    permissionOverwrites: ch.permissionOverwrites.cache.map(p => ({
+      id: p.id, type: p.type,
+      allow: p.allow.bitfield.toString(),
+      deny:  p.deny.bitfield.toString(),
+    })),
+  };
+}
+
+// Save a snapshot of all guild channels right now
+async function saveSnapshot(guild, extraChannel = null) {
+  try {
+    const all = new Map(guild.channels.cache);
+    if (extraChannel) all.set(extraChannel.id, extraChannel);
+    await db.set(`snap.${guild.id}`, [...all.values()].map(snapCh));
+    await db.set(`snap.${guild.id}.time`, Date.now());
+  } catch {}
 }
 
 // ─────────────────────────────────────────────
@@ -83,131 +110,85 @@ async function punish(guild, uid) {
   const m = await guild.members.fetch(uid).catch(() => null);
   if (m?.manageable) await m.roles.set([], 'Antinuke').catch(() => {});
 }
-async function log(gid, guild, msg) {
-  const s = await getSettings(gid);
+async function sendLog(guild, msg) {
+  const s = await getSettings(guild.id);
   if (s.logChannel) guild.channels.cache.get(s.logChannel)?.send(msg).catch(() => {});
 }
 
-function snapCh(ch) {
-  return {
-    id: ch.id, name: ch.name, type: ch.type,
-    parentId: ch.parentId || null,
-    position: ch.position,
-    topic: ch.topic || null,
-    nsfw: ch.nsfw || false,
-    rateLimitPerUser: ch.rateLimitPerUser || 0,
-    bitrate: ch.bitrate || null,
-    userLimit: ch.userLimit || null,
-    permissionOverwrites: ch.permissionOverwrites.cache.map(p => ({
-      id: p.id, type: p.type,
-      allow: p.allow.bitfield.toString(),
-      deny:  p.deny.bitfield.toString(),
-    })),
-  };
-}
-
-// Safely convert stored permission overwrites back to BigInt.
-// Returns [] if anything is invalid — channel still gets created, just without perms.
+// Build permission overwrites safely — never throws
 function buildPerms(overwrites) {
   try {
     return overwrites.map(p => ({
-      id:    p.id,
-      type:  p.type,
+      id: p.id, type: p.type,
       allow: BigInt(p.allow || '0'),
       deny:  BigInt(p.deny  || '0'),
     }));
   } catch { return []; }
 }
 
-// Try to create a channel; if it fails (bad perm IDs etc) retry without overwrites.
+// Try to create a channel; retry without perms if first attempt fails
 async function makeChannel(guild, opts) {
   try { return await guild.channels.create(opts); } catch {}
   try {
     const { permissionOverwrites: _skip, ...clean } = opts;
     return await guild.channels.create(clean);
-  } catch {}
-  return null;
+  } catch { return null; }
 }
 
-// Channel types we can actually create via the API (no threads / directory)
-const CREATABLE = new Set([0, 2, 4, 5, 13, 15]);
+const CREATABLE = new Set([0, 2, 4, 5, 13, 15]); // excludes threads, directory
 
 // ─────────────────────────────────────────────
 //  AUTO-RESTORE
-//  Triggered automatically when a nuke is
-//  detected. No command needed.
 // ─────────────────────────────────────────────
 async function autoRestore(guild) {
   if (restoring.has(guild.id)) return;
   restoring.add(guild.id);
-
   try {
-    await log(guild.id, guild, '🔄 Nuke stopped. Waiting for in-flight deletes to settle…');
+    await sendLog(guild, '🔄 Nuke stopped. Waiting 4s for in-flight deletes to settle…');
     await new Promise(r => setTimeout(r, 4000));
 
     const snapshot = await db.get(`snap.${guild.id}`);
     if (!snapshot?.length) {
-      await log(guild.id, guild, '❌ No snapshot — cannot restore. One is saved on the first channel deletion.');
+      await sendLog(guild, '❌ No snapshot found — enable antinuke and make sure the bot has been running before the nuke.');
       return;
     }
 
-    await log(guild.id, guild, `🔄 Restoring **${snapshot.length}** channels…`);
+    await sendLog(guild, `🔄 Restoring **${snapshot.length}** channels…`);
     let removed = 0, restored = 0, skipped = 0, failed = 0;
 
-    // ── Step 1: delete nuker channels — ALL AT ONCE (parallel) ───
-    // Any channel whose ID is not in the pre-nuke snapshot was created
-    // by the nuker. Deleting them in parallel is much faster.
+    // Step 1: delete ALL channels not in the snapshot in parallel (fastest possible)
     const snapIds = new Set(snapshot.map(c => c.id));
     const nukeChs = [...guild.channels.cache.values()].filter(c => !snapIds.has(c.id));
-
     await Promise.all(nukeChs.map(c => c.delete('Antinuke restore').catch(() => {})));
     removed = nukeChs.length;
-
-    // Brief pause for Discord to process the deletes
     await new Promise(r => setTimeout(r, 2000));
 
-    // ── Step 2: recreate categories first (type 4) ───────────────
-    const catMap = new Map(); // old category ID → new category ID
-
+    // Step 2: recreate categories
+    const catMap = new Map();
     for (const ch of snapshot.filter(c => c.type === 4)) {
       try {
-        // If it still exists (wasn't deleted by the nuke), just remap it
-        const existing = guild.channels.cache.get(ch.id);
-        if (existing) { catMap.set(ch.id, existing.id); skipped++; continue; }
+        const alive = guild.channels.cache.get(ch.id);
+        if (alive) { catMap.set(ch.id, alive.id); skipped++; continue; }
 
         const newCh = await makeChannel(guild, {
-          name:     ch.name,
-          type:     ch.type,
-          position: ch.position,
+          name: ch.name, type: ch.type, position: ch.position,
           permissionOverwrites: buildPerms(ch.permissionOverwrites),
         });
-
         if (newCh) { catMap.set(ch.id, newCh.id); restored++; }
-        else        failed++;
-      } catch (e) {
-        // Each channel is isolated — one failure NEVER stops the loop
-        console.error(`[restore] category "${ch.name}":`, e.message);
-        failed++;
-      }
+        else failed++;
+      } catch (e) { console.error(`[restore cat] ${ch.name}:`, e.message); failed++; }
       await new Promise(r => setTimeout(r, 500));
     }
 
-    // ── Step 3: recreate every other channel ─────────────────────
+    // Step 3: recreate all other channels — each fully isolated in its own try/catch
     for (const ch of snapshot.filter(c => c.type !== 4)) {
       try {
-        // Skip threads and other uncreatable types
-        if (!CREATABLE.has(ch.type)) { skipped++; continue; }
+        if (!CREATABLE.has(ch.type))        { skipped++; continue; }
+        if (guild.channels.cache.has(ch.id)){ skipped++; continue; }
 
-        // Skip if somehow still alive
-        if (guild.channels.cache.has(ch.id)) { skipped++; continue; }
-
-        // Map old category ID to the newly created one
         const parentId = ch.parentId ? catMap.get(ch.parentId) : null;
-
         const opts = {
-          name:     ch.name,
-          type:     ch.type,
-          position: ch.position,
+          name: ch.name, type: ch.type, position: ch.position,
           permissionOverwrites: buildPerms(ch.permissionOverwrites),
         };
         if (parentId)            opts.parent           = parentId;
@@ -219,37 +200,47 @@ async function autoRestore(guild) {
 
         const newCh = await makeChannel(guild, opts);
         if (newCh) restored++; else failed++;
-      } catch (e) {
-        // Isolated — loop always continues to the next channel
-        console.error(`[restore] channel "${ch.name}":`, e.message);
-        failed++;
-      }
+      } catch (e) { console.error(`[restore ch] ${ch.name}:`, e.message); failed++; }
       await new Promise(r => setTimeout(r, 500));
     }
 
-    await log(guild.id, guild,
-      `✅ **Restore complete** — deleted **${removed}** nuke channels, ` +
+    await sendLog(guild,
+      `✅ **Restore complete** — removed **${removed}** nuke channels, ` +
       `restored **${restored}**` +
-      (skipped ? `, skipped **${skipped}** (already existed / threads)` : '') +
-      (failed  ? `, **${failed}** failed` : '') + '.'
+      (skipped ? `, skipped **${skipped}**` : '') +
+      (failed  ? `, **${failed}** failed`   : '') + '.'
     );
-
-  } catch (e) {
-    console.error('[autoRestore fatal]', e);
-  } finally {
-    restoring.delete(guild.id);
-  }
+  } catch (e) { console.error('[autoRestore]', e); }
+  finally     { restoring.delete(guild.id); }
 }
 
 // ─────────────────────────────────────────────
 //  READY
 // ─────────────────────────────────────────────
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`✅ ${client.user.tag} online`);
   client.user.setPresence({
     activities: [{ name: '.gg/rasengan', type: ActivityType.Watching }],
     status: 'online',
   });
+
+  // Take an initial snapshot for every guild that has antinuke enabled
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const s = await getSettings(guild.id);
+      if (s.enabled) { await saveSnapshot(guild); console.log(`📸 Snapshot: ${guild.name}`); }
+    } catch {}
+  }
+
+  // Refresh snapshots every 2 minutes so they're always current
+  setInterval(async () => {
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        const s = await getSettings(guild.id);
+        if (s.enabled && !restoring.has(guild.id)) await saveSnapshot(guild);
+      } catch {}
+    }
+  }, 2 * 60 * 1000);
 });
 
 // ─────────────────────────────────────────────
@@ -272,7 +263,7 @@ client.on('guildMemberAdd', async member => {
   }
   for (const rid of (await db.get(`autorole.${guild.id}.roles`)) || []) {
     const r = guild.roles.cache.get(rid);
-    if (r && guild.members.me.roles.highest.position > r.position) await member.roles.add(r).catch(()=>{});
+    if (r && guild.members.me.roles.highest.position > r.position) member.roles.add(r).catch(()=>{});
   }
 });
 
@@ -283,69 +274,72 @@ client.on('channelDelete', async channel => {
   if (!channel.guild || restoring.has(channel.guild.id)) return;
   const { guild } = channel;
 
-  // Kick off audit log fetch immediately (parallel, no await yet)
+  // ── CRITICAL: capture guild channel list SYNCHRONOUSLY before any await ──
+  // If we await first, Node's event loop processes more deletions and removes
+  // channels from guild.channels.cache before we can snapshot them.
+  const capturedChannels = [...guild.channels.cache.values()];
+  if (!capturedChannels.find(c => c.id === channel.id)) capturedChannels.push(channel);
+
+  // Start audit log fetch in the background immediately
   prefetch(guild, AuditLogEvent.ChannelDelete);
 
-  // Take full guild snapshot once per 30-second window.
-  // Captures parentId BEFORE category gets deleted and channels lose their parent.
+  // Save snapshot using the synchronously-captured list
+  // 5-second cooldown so rapid nuke deletions all share the first (pre-nuke) snapshot
   try {
     const last = await db.get(`snap.${guild.id}.time`);
-    if (!last || Date.now() - last > 30_000) {
-      const all = new Map(guild.channels.cache);
-      all.set(channel.id, channel);
-      await db.set(`snap.${guild.id}`,      [...all.values()].map(snapCh));
+    if (!last || Date.now() - last > 5_000) {
+      await db.set(`snap.${guild.id}`, capturedChannels.map(snapCh));
       await db.set(`snap.${guild.id}.time`, Date.now());
     }
   } catch {}
 
-  // Instant in-memory count — no DB, no await
-  if (!crossed(counts.ch, guild.id)) return;
+  if (!crossed(counters.ch, guild.id)) return;
 
   const s = await getSettings(guild.id);
   if (!s.enabled) return;
 
-  // By now the prefetch from the 1st deletion is likely already resolved
   const exec = await getExec(guild, AuditLogEvent.ChannelDelete);
   if (!exec || trusted(s, exec.id, guild.ownerId, guild.members.me?.id)) return;
 
-  await log(guild.id, guild, `🚨 **Antinuke** — **${exec.tag}** nuking! Banning + auto-restoring…`);
+  await sendLog(guild, `🚨 **Antinuke** — **${exec.tag}** is nuking! Banning + auto-restoring…`);
   await punish(guild, exec.id);
-  autoRestore(guild); // fire-and-forget so punish lands first
+  autoRestore(guild);
 });
 
 client.on('roleDelete', async role => {
   if (!role.guild || restoring.has(role.guild.id)) return;
   prefetch(role.guild, AuditLogEvent.RoleDelete);
-  if (!crossed(counts.role, role.guild.id)) return;
+  if (!crossed(counters.role, role.guild.id)) return;
   const s = await getSettings(role.guild.id);
   if (!s.enabled) return;
   const exec = await getExec(role.guild, AuditLogEvent.RoleDelete);
   if (!exec || trusted(s, exec.id, role.guild.ownerId, role.guild.members.me?.id)) return;
-  await log(role.guild.id, role.guild, `🚨 **Antinuke** — **${exec.tag}** mass-deleting roles! Banning…`);
+  await sendLog(role.guild, `🚨 **Antinuke** — **${exec.tag}** is mass-deleting roles! Banning…`);
   await punish(role.guild, exec.id);
 });
 
 client.on('guildBanAdd', async ban => {
   prefetch(ban.guild, AuditLogEvent.MemberBan);
-  if (!crossed(counts.ban, ban.guild.id)) return;
+  if (!crossed(counters.ban, ban.guild.id)) return;
   const s = await getSettings(ban.guild.id);
   if (!s.enabled) return;
   const exec = await getExec(ban.guild, AuditLogEvent.MemberBan);
   if (!exec || trusted(s, exec.id, ban.guild.ownerId, ban.guild.members.me?.id)) return;
-  await log(ban.guild.id, ban.guild, `🚨 **Antinuke** — **${exec.tag}** mass-banning! Banning…`);
+  await sendLog(ban.guild, `🚨 **Antinuke** — **${exec.tag}** is mass-banning! Banning…`);
   await punish(ban.guild, exec.id);
 });
 
 client.on('guildMemberRemove', async member => {
-  if (!crossed(counts.kick, member.guild.id)) return;
+  if (!crossed(counters.kick, member.guild.id)) return;
   const s = await getSettings(member.guild.id);
   if (!s.enabled) return;
   try {
     const logs  = await member.guild.fetchAuditLogs({ type: AuditLogEvent.MemberKick, limit: 1 });
     const entry = logs.entries.first();
-    if (!entry?.executor || entry.target?.id !== member.id || Date.now() - entry.createdTimestamp > 3000) return;
+    if (!entry?.executor || entry.target?.id !== member.id) return;
+    if (Date.now() - entry.createdTimestamp > 3000) return;
     if (trusted(s, entry.executor.id, member.guild.ownerId, member.guild.members.me?.id)) return;
-    await log(member.guild.id, member.guild, `🚨 **Antinuke** — **${entry.executor.tag}** mass-kicking! Banning…`);
+    await sendLog(member.guild, `🚨 **Antinuke** — **${entry.executor.tag}** is mass-kicking! Banning…`);
     await punish(member.guild, entry.executor.id);
   } catch {}
 });
@@ -366,8 +360,8 @@ client.on('messageCreate', async message => {
         { name:'🎭 Roles',      value:'`-role add @user <name>`\n`-role remove @user <name>`' },
         { name:'👋 Welcome',    value:'`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`' },
         { name:'⚙️ Config',     value:'`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
-        { name:'🛡️ Antinuke (owner only)', value:'`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke status`\n`-antinuke restore` — manual restore\n`-antinuke restore clear`' },
-      ).setFooter({ text:`Prefix: ${PREFIX}  •  Auto-restore fires automatically on nuke detection` })] });
+        { name:'🛡️ Antinuke (owner only)', value:'`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
+      ).setFooter({ text:`Prefix: ${PREFIX}  •  Snapshot refreshes every 2 min. Auto-restores on nuke detection.` })] });
   }
 
   if (cmd === 'ban') {
@@ -400,7 +394,7 @@ client.on('messageCreate', async message => {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return message.reply('❌ You need **Timeout Members** permission.');
     const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(()=>null);
     if (!t) return message.reply('❌ Usage: `-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`');
-    const dur = {'60s':60,'5m':300,'10m':600,'1h':3600,'1d':86400,'1w':604800};
+    const dur={'60s':60,'5m':300,'10m':600,'1h':3600,'1d':86400,'1w':604800};
     const dk=args[1]?.toLowerCase(), secs=dur[dk];
     if (!secs) return message.reply('❌ Duration: `60s` `5m` `10m` `1h` `1d` `1w`');
     const r=args.slice(2).join(' ')||'No reason provided';
@@ -425,7 +419,7 @@ client.on('messageCreate', async message => {
   else if (cmd === 'warnings' || cmd === 'warns') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) return message.reply('❌ You need **Timeout Members** permission.');
     const isClear=args[0]?.toLowerCase()==='clear';
-    const t = isClear ? message.mentions.users.first()||await client.users.fetch(args[1]).catch(()=>null) : message.mentions.users.first()||await client.users.fetch(args[0]).catch(()=>null);
+    const t=isClear ? message.mentions.users.first()||await client.users.fetch(args[1]).catch(()=>null) : message.mentions.users.first()||await client.users.fetch(args[0]).catch(()=>null);
     if (!t) return message.reply('❌ Usage: `-warnings @user` or `-warnings clear @user`');
     const key=`warnings.${message.guild.id}.${t.id}`;
     if (isClear) { await db.delete(key); return message.reply(`✅ Cleared warnings for **${t.tag}**.`); }
@@ -473,10 +467,8 @@ client.on('messageCreate', async message => {
     if (ch) { await db.set(`welcome.${gid}.channel`,ch.id); return message.reply(`✅ Welcome channel set to ${ch}.`); }
     const sub=args[0]?.toLowerCase();
     if (sub==='message') {
-      const text=args.slice(1).join(' ');
-      if (!text) return message.reply('❌ Usage: `-setwelcome message Hello {user}!`');
-      await db.set(`welcome.${gid}.message`,text);
-      return message.reply('✅ Set! Placeholders: `{user}` `{username}` `{server}` `{memberCount}`');
+      const text=args.slice(1).join(' '); if (!text) return message.reply('❌ Usage: `-setwelcome message Hello {user}!`');
+      await db.set(`welcome.${gid}.message`,text); return message.reply('✅ Set! Placeholders: `{user}` `{username}` `{server}` `{memberCount}`');
     }
     if (sub==='disable') { await db.delete(`welcome.${gid}.channel`); await db.delete(`welcome.${gid}.message`); return message.reply('✅ Disabled.'); }
     if (sub==='test') {
@@ -484,7 +476,7 @@ client.on('messageCreate', async message => {
       const chan=message.guild.channels.cache.get(cid); if (!chan) return message.reply('❌ Channel no longer exists.');
       let msg=await db.get(`welcome.${gid}.message`);
       if (msg) { msg=msg.replace(/{user}/g,`<@${message.author.id}>`).replace(/{username}/g,message.author.username).replace(/{server}/g,message.guild.name).replace(/{memberCount}/g,message.guild.memberCount); await chan.send(msg); }
-      else { await chan.send({ embeds:[new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${message.guild.name}!`).setDescription(`Hey <@${message.author.id}>, member **#${message.guild.memberCount}**!`).setThumbnail(message.author.displayAvatarURL()).setTimestamp()] }); }
+      else await chan.send({ embeds:[new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${message.guild.name}!`).setDescription(`Hey <@${message.author.id}>, member **#${message.guild.memberCount}**!`).setThumbnail(message.author.displayAvatarURL()).setTimestamp()] });
       return message.reply(`✅ Test sent to ${chan}.`);
     }
     message.reply('❌ Usage: `-setwelcome #channel` | `message <text>` | `disable` | `test`');
@@ -495,7 +487,7 @@ client.on('messageCreate', async message => {
     if (sub==='add') {
       if (!role) return message.reply('❌ Usage: `-autorole add @role`');
       if (message.guild.members.me.roles.highest.position<=role.position) return message.reply("❌ That role is above my highest role.");
-      const roles=(await db.get(key))||[]; if (roles.includes(role.id)) return message.reply(`❌ Already an autorole.`);
+      const roles=(await db.get(key))||[]; if (roles.includes(role.id)) return message.reply('❌ Already an autorole.');
       roles.push(role.id); await db.set(key,roles); return message.reply(`✅ **${role.name}** will be given to new members.`);
     }
     if (sub==='remove') {
@@ -504,7 +496,7 @@ client.on('messageCreate', async message => {
       await db.set(key,roles.filter(id=>id!==role.id)); return message.reply(`✅ Removed **${role.name}**.`);
     }
     if (sub==='list') {
-      const roles=(await db.get(key))||[]; if (!roles.length) return message.reply('❌ No autoroles set.');
+      const roles=(await db.get(key))||[]; if (!roles.length) return message.reply('❌ No autoroles.');
       return message.reply({ embeds:[new EmbedBuilder().setColor(0x5865f2).setTitle('🎭 Autoroles').setDescription(roles.map(id=>{ const r=message.guild.roles.cache.get(id); return r?`• ${r}`:'• Unknown'; }).join('\n')).setFooter({text:`${roles.length} role(s)`})] });
     }
     message.reply('❌ Usage: `add @role` | `remove @role` | `list`');
@@ -514,8 +506,9 @@ client.on('messageCreate', async message => {
     const sub=args[0]?.toLowerCase(), gid=message.guild.id;
     if (sub==='enable') {
       await db.set(`antinuke.${gid}.enabled`,true); clearCache(gid);
+      await saveSnapshot(message.guild); // take immediate snapshot on enable
       return message.reply({ embeds:[new EmbedBuilder().setColor(0x00cc44).setTitle('🛡️ Antinuke Enabled')
-        .setDescription('**Triggers at:** 2 deletions / bans / kicks in 4s\n**On trigger:** instantly bans nuker + auto-restores all channels\n\n⚠️ Give this bot the **highest role** so it can ban anyone.\n`-antinuke setlog #channel` — receive alerts there.\n`-antinuke whitelist add @user` — trust your admins.')] });
+        .setDescription('**Triggers at:** 2 deletions / bans / kicks in 4s\n**On trigger:** bans nuker + auto-restores channels instantly\n**Snapshot:** saved now and refreshed every 2 minutes\n\n⚠️ Give this bot the **highest role** in the server.\n`-antinuke setlog #channel` — receive alerts\n`-antinuke whitelist add @user` — trust your admins')] });
     }
     if (sub==='disable') { await db.set(`antinuke.${gid}.enabled`,false); clearCache(gid); return message.reply('✅ Antinuke disabled.'); }
     if (sub==='setlog') {
@@ -546,10 +539,9 @@ client.on('messageCreate', async message => {
     }
     if (sub==='restore') {
       if (args[1]?.toLowerCase()==='clear') { await db.delete(`snap.${gid}`); await db.delete(`snap.${gid}.time`); return message.reply('✅ Snapshot cleared.'); }
-      if (!(await db.get(`snap.${gid}`))?.length) return message.reply('❌ No snapshot found.');
+      if (!(await db.get(`snap.${gid}`))?.length) return message.reply('❌ No snapshot. Run `-antinuke enable` first.');
       await message.reply('⏳ Starting restore…');
-      autoRestore(message.guild);
-      return;
+      autoRestore(message.guild); return;
     }
     message.reply('❌ Subcommands: `enable` `disable` `setlog #ch` `whitelist add/remove @user` `status` `restore` `restore clear`');
   }
