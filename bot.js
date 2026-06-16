@@ -21,10 +21,12 @@ const PREFIX = '-';
 
 // ─────────────────────────────────────────────
 //  ANTINUKE
+//  Threshold lowered to 2 actions so the bot
+//  triggers faster before more damage is done
 // ─────────────────────────────────────────────
 const tracker = new Map();
-const LIMITS  = { ban: 3, kick: 3, channelDelete: 3, roleDelete: 3 };
-const WINDOW  = 10_000;
+const LIMITS  = { ban: 2, kick: 2, channelDelete: 2, roleDelete: 2 };
+const WINDOW  = 8_000; // 8 second window
 
 async function trackAction(guild, userId, type) {
   if (!(await db.get(`antinuke.${guild.id}.enabled`))) return false;
@@ -50,10 +52,19 @@ async function trackAction(guild, userId, type) {
 }
 
 async function punish(guild, userId) {
+  // Always attempt ban first — fastest action
+  // Role stripping is secondary since ban is what stops the damage
+  if (guild.members.me?.permissions.has(PermissionFlagsBits.BanMembers)) {
+    await guild.members.ban(userId, {
+      reason:               'Antinuke: suspicious activity',
+      deleteMessageSeconds: 0,
+    }).catch(() => {});
+  }
+  // Also strip roles (in case ban fails due to hierarchy)
   const member = await guild.members.fetch(userId).catch(() => null);
-  if (member?.manageable) await member.roles.set([], 'Antinuke').catch(() => {});
-  if (guild.members.me?.permissions.has(PermissionFlagsBits.BanMembers))
-    await guild.members.ban(userId, { reason: 'Antinuke: suspicious activity' }).catch(() => {});
+  if (member?.manageable) {
+    await member.roles.set([], 'Antinuke').catch(() => {});
+  }
 }
 
 async function nukeLog(guild, msg) {
@@ -61,7 +72,7 @@ async function nukeLog(guild, msg) {
   if (id) guild.channels.cache.get(id)?.send(msg).catch(() => {});
 }
 
-// Helper: snapshot a single channel object into a plain object
+// Snapshot a channel into a plain storable object
 function snapshotChannel(ch) {
   return {
     id:               ch.id,
@@ -81,6 +92,25 @@ function snapshotChannel(ch) {
       deny:  p.deny.bitfield.toString(),
     })),
   };
+}
+
+// Create a channel from a snapshot, retrying without perms if it fails
+async function restoreChannel(guild, ch, opts) {
+  // First attempt: full restore with all permission overwrites
+  try {
+    await guild.channels.create(opts);
+    return true;
+  } catch {}
+
+  // Second attempt: strip permission overwrites and try again
+  // (invalid role/user IDs from old overwrites can cause failures)
+  try {
+    const { permissionOverwrites: _dropped, ...optsNoperms } = opts;
+    await guild.channels.create(optsNoperms);
+    return true;
+  } catch {}
+
+  return false;
 }
 
 // ─────────────────────────────────────────────
@@ -150,34 +180,23 @@ client.on('channelDelete', async channel => {
   if (!channel.guild) return;
   const { guild } = channel;
 
-  // ── Take a full guild snapshot at the START of each deletion wave ──
-  //
-  // WHY: If a nuker deletes the category first, channels inside it lose
-  // their parentId before the channelDelete event fires for them.
-  // By snapshotting the ENTIRE guild at the very first deletion, we
-  // capture all parentId relationships before anything is lost.
-  //
-  // The snapshot refreshes only after a 30-second gap (so rapid deletions
-  // during a nuke all use the same pre-nuke snapshot).
+  // ── Full guild snapshot ───────────────────────────────────────────
+  // Taken at the very first deletion of each wave (30s cooldown).
+  // This captures parentId relationships BEFORE categories get deleted
+  // and channels inside them lose their parent reference.
   try {
     const snapTimeKey = `snap.${guild.id}.time`;
     const lastSnap    = await db.get(snapTimeKey);
 
     if (!lastSnap || Date.now() - lastSnap > 30_000) {
-      // Build a map of ALL channels currently in the guild.
-      // Also include the channel being deleted right now, since it's
-      // still accessible via the event parameter and still has its parentId.
       const allChans = new Map(guild.channels.cache);
-      allChans.set(channel.id, channel); // ensure it's in there
-
-      const snap = [...allChans.values()].map(snapshotChannel);
-
-      await db.set(`snap.${guild.id}`, snap);
-      await db.set(snapTimeKey, Date.now());
+      allChans.set(channel.id, channel); // include the one being deleted right now
+      await db.set(`snap.${guild.id}`,      [...allChans.values()].map(snapshotChannel));
+      await db.set(snapTimeKey,             Date.now());
     }
   } catch {}
 
-  // ── Antinuke threshold check ──────────────────────────────────────
+  // ── Antinuke check ────────────────────────────────────────────────
   try {
     const logs = await guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 1 });
     const exec = logs.entries.first()?.executor;
@@ -231,55 +250,11 @@ client.on('messageCreate', async message => {
       embeds: [new EmbedBuilder().setColor(0x5865f2)
         .setTitle('📋 Commands')
         .addFields(
-          {
-            name: '🔨 Moderation',
-            value: [
-              '`-ban @user [reason]`',
-              '`-kick @user [reason]`',
-              '`-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`',
-              '`-warn @user <reason>`',
-              '`-warnings @user`',
-              '`-warnings clear @user`',
-              '`-purge <1-100>`',
-              '`-purge @user <1-100>`',
-            ].join('\n'),
-          },
-          {
-            name: '🎭 Roles',
-            value: [
-              '`-role add @user <role name>`',
-              '`-role remove @user <role name>`',
-            ].join('\n'),
-          },
-          {
-            name: '👋 Welcome',
-            value: [
-              '`-setwelcome #channel`',
-              '`-setwelcome message <text>`',
-              '`-setwelcome disable`',
-              '`-setwelcome test`',
-            ].join('\n'),
-          },
-          {
-            name: '⚙️ Config',
-            value: [
-              '`-autorole add @role`',
-              '`-autorole remove @role`',
-              '`-autorole list`',
-            ].join('\n'),
-          },
-          {
-            name: '🛡️ Antinuke (owner only)',
-            value: [
-              '`-antinuke enable`',
-              '`-antinuke disable`',
-              '`-antinuke setlog #channel`',
-              '`-antinuke whitelist add/remove @user`',
-              '`-antinuke status`',
-              '`-antinuke restore` — delete nuke channels & rebuild originals',
-              '`-antinuke restore clear` — clear the saved snapshot',
-            ].join('\n'),
-          },
+          { name: '🔨 Moderation', value: ['`-ban @user [reason]`','`-kick @user [reason]`','`-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`','`-warn @user <reason>`','`-warnings @user`','`-warnings clear @user`','`-purge <1-100>`','`-purge @user <1-100>`'].join('\n') },
+          { name: '🎭 Roles',      value: ['`-role add @user <role name>`','`-role remove @user <role name>`'].join('\n') },
+          { name: '👋 Welcome',    value: ['`-setwelcome #channel`','`-setwelcome message <text>`','`-setwelcome disable`','`-setwelcome test`'].join('\n') },
+          { name: '⚙️ Config',     value: ['`-autorole add @role`','`-autorole remove @role`','`-autorole list`'].join('\n') },
+          { name: '🛡️ Antinuke (owner only)', value: ['`-antinuke enable`','`-antinuke disable`','`-antinuke setlog #channel`','`-antinuke whitelist add/remove @user`','`-antinuke status`','`-antinuke restore` — delete nuke channels & rebuild originals','`-antinuke restore clear` — clear the saved snapshot'].join('\n') },
         )
         .setFooter({ text: `Prefix: ${PREFIX}  •  Welcome placeholders: {user} {username} {server} {memberCount}` })],
     });
@@ -289,81 +264,56 @@ client.on('messageCreate', async message => {
   if (cmd === 'ban') {
     if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
       return message.reply('❌ You need **Ban Members** permission.');
-    const target = message.mentions.members.first()
-      || await message.guild.members.fetch(args[0]).catch(() => null);
+    const target = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
     if (!target) return message.reply('❌ Usage: `-ban @user [reason]`');
     const reason = args.slice(1).join(' ') || 'No reason provided';
     if (target.id === message.author.id)     return message.reply('❌ You cannot ban yourself.');
     if (target.id === message.guild.ownerId) return message.reply('❌ You cannot ban the server owner.');
     if (!target.bannable)                    return message.reply("❌ I can't ban that user.");
-    if (message.member.roles.highest.position <= target.roles.highest.position)
-      return message.reply('❌ That user has an equal or higher role than you.');
-    await target.send({ embeds: [new EmbedBuilder().setColor(0xff4444)
-      .setTitle(`Banned from ${message.guild.name}`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
+    if (message.member.roles.highest.position <= target.roles.highest.position) return message.reply('❌ That user has an equal or higher role than you.');
+    await target.send({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle(`Banned from ${message.guild.name}`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
     await target.ban({ reason: `${message.author.tag}: ${reason}` });
-    message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔨 Banned')
-      .addFields(
-        { name: 'User',      value: `${target.user.tag}`, inline: true },
-        { name: 'Moderator', value: message.author.tag,   inline: true },
-        { name: 'Reason',    value: reason },
-      ).setTimestamp()] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔨 Banned').addFields({ name: 'User', value: target.user.tag, inline: true },{ name: 'Moderator', value: message.author.tag, inline: true },{ name: 'Reason', value: reason }).setTimestamp()] });
   }
 
   // -kick
   else if (cmd === 'kick') {
     if (!message.member.permissions.has(PermissionFlagsBits.KickMembers))
       return message.reply('❌ You need **Kick Members** permission.');
-    const target = message.mentions.members.first()
-      || await message.guild.members.fetch(args[0]).catch(() => null);
+    const target = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
     if (!target) return message.reply('❌ Usage: `-kick @user [reason]`');
     const reason = args.slice(1).join(' ') || 'No reason provided';
     if (target.id === message.author.id)     return message.reply('❌ You cannot kick yourself.');
     if (target.id === message.guild.ownerId) return message.reply('❌ You cannot kick the server owner.');
     if (!target.kickable)                    return message.reply("❌ I can't kick that user.");
-    if (message.member.roles.highest.position <= target.roles.highest.position)
-      return message.reply('❌ That user has an equal or higher role than you.');
-    await target.send({ embeds: [new EmbedBuilder().setColor(0xff8800)
-      .setTitle(`Kicked from ${message.guild.name}`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
+    if (message.member.roles.highest.position <= target.roles.highest.position) return message.reply('❌ That user has an equal or higher role than you.');
+    await target.send({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle(`Kicked from ${message.guild.name}`).addFields({ name: 'Reason', value: reason })] }).catch(() => {});
     await target.kick(`${message.author.tag}: ${reason}`);
-    message.reply({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle('👢 Kicked')
-      .addFields(
-        { name: 'User',      value: `${target.user.tag}`, inline: true },
-        { name: 'Moderator', value: message.author.tag,   inline: true },
-        { name: 'Reason',    value: reason },
-      ).setTimestamp()] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle('👢 Kicked').addFields({ name: 'User', value: target.user.tag, inline: true },{ name: 'Moderator', value: message.author.tag, inline: true },{ name: 'Reason', value: reason }).setTimestamp()] });
   }
 
   // -timeout
   else if (cmd === 'timeout' || cmd === 'mute') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
-    const target = message.mentions.members.first()
-      || await message.guild.members.fetch(args[0]).catch(() => null);
+    const target = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
     if (!target) return message.reply('❌ Usage: `-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`');
     const durations = { '60s': 60, '5m': 300, '10m': 600, '1h': 3600, '1d': 86400, '1w': 604800 };
-    const durKey    = args[1]?.toLowerCase();
-    const secs      = durations[durKey];
+    const durKey = args[1]?.toLowerCase();
+    const secs   = durations[durKey];
     if (!secs) return message.reply('❌ Duration must be: `60s` `5m` `10m` `1h` `1d` `1w`');
     const reason = args.slice(2).join(' ') || 'No reason provided';
     if (!target.moderatable) return message.reply("❌ I can't timeout that user.");
-    if (message.member.roles.highest.position <= target.roles.highest.position)
-      return message.reply('❌ That user has an equal or higher role than you.');
+    if (message.member.roles.highest.position <= target.roles.highest.position) return message.reply('❌ That user has an equal or higher role than you.');
     await target.timeout(secs * 1000, `${message.author.tag}: ${reason}`);
-    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('⏱️ Timed Out')
-      .addFields(
-        { name: 'User',      value: `${target.user.tag}`, inline: true },
-        { name: 'Duration',  value: durKey,               inline: true },
-        { name: 'Moderator', value: message.author.tag,   inline: true },
-        { name: 'Reason',    value: reason },
-      ).setTimestamp()] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('⏱️ Timed Out').addFields({ name: 'User', value: target.user.tag, inline: true },{ name: 'Duration', value: durKey, inline: true },{ name: 'Moderator', value: message.author.tag, inline: true },{ name: 'Reason', value: reason }).setTimestamp()] });
   }
 
   // -warn
   else if (cmd === 'warn') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
-    const target = message.mentions.members.first()
-      || await message.guild.members.fetch(args[0]).catch(() => null);
+    const target = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
     if (!target) return message.reply('❌ Usage: `-warn @user <reason>`');
     const reason = args.slice(1).join(' ');
     if (!reason) return message.reply('❌ Please provide a reason.');
@@ -371,16 +321,8 @@ client.on('messageCreate', async message => {
     const key = `warnings.${message.guild.id}.${target.id}`;
     await db.push(key, { reason, moderator: message.author.tag, date: new Date().toISOString() });
     const count = ((await db.get(key)) || []).length;
-    await target.send({ embeds: [new EmbedBuilder().setColor(0xffcc00)
-      .setTitle(`Warned in ${message.guild.name}`)
-      .addFields({ name: 'Reason', value: reason }, { name: 'Warning #', value: String(count) })] }).catch(() => {});
-    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('⚠️ Warned')
-      .addFields(
-        { name: 'User',      value: `${target.user.tag}`, inline: true },
-        { name: 'Warning #', value: String(count),        inline: true },
-        { name: 'Moderator', value: message.author.tag,   inline: true },
-        { name: 'Reason',    value: reason },
-      ).setTimestamp()] });
+    await target.send({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle(`Warned in ${message.guild.name}`).addFields({ name: 'Reason', value: reason },{ name: 'Warning #', value: String(count) })] }).catch(() => {});
+    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('⚠️ Warned').addFields({ name: 'User', value: target.user.tag, inline: true },{ name: 'Warning #', value: String(count), inline: true },{ name: 'Moderator', value: message.author.tag, inline: true },{ name: 'Reason', value: reason }).setTimestamp()] });
   }
 
   // -warnings
@@ -393,19 +335,13 @@ client.on('messageCreate', async message => {
       : message.mentions.users.first() || await client.users.fetch(args[0]).catch(() => null);
     if (!target) return message.reply('❌ Usage: `-warnings @user` or `-warnings clear @user`');
     const key = `warnings.${message.guild.id}.${target.id}`;
-    if (isClear) {
-      await db.delete(key);
-      return message.reply(`✅ Cleared all warnings for **${target.tag}**.`);
-    }
+    if (isClear) { await db.delete(key); return message.reply(`✅ Cleared all warnings for **${target.tag}**.`); }
     const list = (await db.get(key)) || [];
     if (!list.length) return message.reply(`✅ **${target.tag}** has no warnings.`);
     const lines = list.slice(-10).reverse().map((w, i) =>
       `**${list.length - i}.** ${w.reason}\n> by ${w.moderator} • <t:${Math.floor(new Date(w.date).getTime() / 1000)}:R>`
     );
-    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00)
-      .setTitle(`⚠️ Warnings for ${target.tag}`)
-      .setDescription(lines.join('\n\n'))
-      .setFooter({ text: `Total: ${list.length}` }).setTimestamp()] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle(`⚠️ Warnings for ${target.tag}`).setDescription(lines.join('\n\n')).setFooter({ text: `Total: ${list.length}` }).setTimestamp()] });
   }
 
   // -purge
@@ -413,17 +349,13 @@ client.on('messageCreate', async message => {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageMessages))
       return message.reply('❌ You need **Manage Messages** permission.');
     const filterMember = message.mentions.members.first();
-    const amount       = parseInt(filterMember ? args[1] : args[0]);
-    if (isNaN(amount) || amount < 1 || amount > 100)
-      return message.reply('❌ Usage: `-purge <1-100>` or `-purge @user <1-100>`');
+    const amount = parseInt(filterMember ? args[1] : args[0]);
+    if (isNaN(amount) || amount < 1 || amount > 100) return message.reply('❌ Usage: `-purge <1-100>` or `-purge @user <1-100>`');
     await message.delete().catch(() => {});
     const fetched  = await message.channel.messages.fetch({ limit: filterMember ? 100 : amount });
-    const toDelete = filterMember
-      ? [...fetched.filter(m => m.author.id === filterMember.id).values()].slice(0, amount)
-      : [...fetched.values()];
+    const toDelete = filterMember ? [...fetched.filter(m => m.author.id === filterMember.id).values()].slice(0, amount) : [...fetched.values()];
     const deleted  = await message.channel.bulkDelete(toDelete, true);
-    const confirm  = await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x00cc44)
-      .setDescription(`🗑️ Deleted **${deleted.size}** messages.`)] });
+    const confirm  = await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription(`🗑️ Deleted **${deleted.size}** messages.`)] });
     setTimeout(() => confirm.delete().catch(() => {}), 4000);
   }
 
@@ -433,33 +365,23 @@ client.on('messageCreate', async message => {
       return message.reply('❌ You need **Manage Roles** permission.');
     const sub    = args[0]?.toLowerCase();
     const target = message.mentions.members.first();
-    if (!['add', 'remove'].includes(sub))
-      return message.reply('❌ Usage: `-role add @user <role name>` or `-role remove @user <role name>`');
-    if (!target)
-      return message.reply('❌ Please mention a user. Example: `-role add @user member`');
+    if (!['add', 'remove'].includes(sub)) return message.reply('❌ Usage: `-role add @user <role name>` or `-role remove @user <role name>`');
+    if (!target) return message.reply('❌ Please mention a user. Example: `-role add @user member`');
     const roleName = args.slice(2).join(' ');
-    if (!roleName)
-      return message.reply('❌ Please provide a role name. Example: `-role add @user member`');
-    const role = message.mentions.roles.first()
-      || message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
-    if (!role)
-      return message.reply(`❌ Could not find a role named **${roleName}**.`);
-    if (message.guild.members.me.roles.highest.position <= role.position)
-      return message.reply("❌ That role is above my highest role.");
-    if (message.member.roles.highest.position <= role.position)
-      return message.reply("❌ That role is above your highest role.");
-    if (role.managed)
-      return message.reply('❌ That role is managed by an integration.');
+    if (!roleName) return message.reply('❌ Please provide a role name. Example: `-role add @user member`');
+    const role = message.mentions.roles.first() || message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+    if (!role) return message.reply(`❌ Could not find a role named **${roleName}**.`);
+    if (message.guild.members.me.roles.highest.position <= role.position) return message.reply("❌ That role is above my highest role.");
+    if (message.member.roles.highest.position <= role.position) return message.reply("❌ That role is above your highest role.");
+    if (role.managed) return message.reply('❌ That role is managed by an integration.');
     if (sub === 'add') {
       if (target.roles.cache.has(role.id)) return message.reply(`❌ ${target} already has **${role.name}**.`);
       await target.roles.add(role, `Added by ${message.author.tag}`);
-      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Role Added')
-        .addFields({ name: 'Member', value: `${target}`, inline: true }, { name: 'Role', value: role.name, inline: true })] });
+      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Role Added').addFields({ name: 'Member', value: `${target}`, inline: true },{ name: 'Role', value: role.name, inline: true })] });
     } else {
       if (!target.roles.cache.has(role.id)) return message.reply(`❌ ${target} doesn't have **${role.name}**.`);
       await target.roles.remove(role, `Removed by ${message.author.tag}`);
-      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Role Removed')
-        .addFields({ name: 'Member', value: `${target}`, inline: true }, { name: 'Role', value: role.name, inline: true })] });
+      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Role Removed').addFields({ name: 'Member', value: `${target}`, inline: true },{ name: 'Role', value: role.name, inline: true })] });
     }
   }
 
@@ -469,10 +391,7 @@ client.on('messageCreate', async message => {
       return message.reply('❌ You need **Manage Server** permission.');
     const gid = message.guild.id;
     const ch  = message.mentions.channels.first();
-    if (ch) {
-      await db.set(`welcome.${gid}.channel`, ch.id);
-      return message.reply(`✅ Welcome channel set to ${ch}.\nSet a message with \`-setwelcome message Hello {user}!\``);
-    }
+    if (ch) { await db.set(`welcome.${gid}.channel`, ch.id); return message.reply(`✅ Welcome channel set to ${ch}.\nSet a message with \`-setwelcome message Hello {user}!\``); }
     const sub = args[0]?.toLowerCase();
     if (sub === 'message') {
       const text = args.slice(1).join(' ');
@@ -480,11 +399,7 @@ client.on('messageCreate', async message => {
       await db.set(`welcome.${gid}.message`, text);
       return message.reply(`✅ Welcome message set! Placeholders: \`{user}\` \`{username}\` \`{server}\` \`{memberCount}\``);
     }
-    if (sub === 'disable') {
-      await db.delete(`welcome.${gid}.channel`);
-      await db.delete(`welcome.${gid}.message`);
-      return message.reply('✅ Welcome messages disabled.');
-    }
+    if (sub === 'disable') { await db.delete(`welcome.${gid}.channel`); await db.delete(`welcome.${gid}.message`); return message.reply('✅ Welcome messages disabled.'); }
     if (sub === 'test') {
       const channelId = await db.get(`welcome.${gid}.channel`);
       if (!channelId) return message.reply('❌ Set a channel first with `-setwelcome #channel`.');
@@ -492,17 +407,10 @@ client.on('messageCreate', async message => {
       if (!channel) return message.reply('❌ Welcome channel no longer exists.');
       let msg = await db.get(`welcome.${gid}.message`);
       if (msg) {
-        msg = msg
-          .replace(/{user}/g, `<@${message.author.id}>`)
-          .replace(/{username}/g, message.author.username)
-          .replace(/{server}/g, message.guild.name)
-          .replace(/{memberCount}/g, message.guild.memberCount);
+        msg = msg.replace(/{user}/g,`<@${message.author.id}>`).replace(/{username}/g,message.author.username).replace(/{server}/g,message.guild.name).replace(/{memberCount}/g,message.guild.memberCount);
         await channel.send(msg);
       } else {
-        await channel.send({ embeds: [new EmbedBuilder().setColor(0x5865f2)
-          .setTitle(`Welcome to ${message.guild.name}!`)
-          .setDescription(`Hey <@${message.author.id}>, you are member **#${message.guild.memberCount}**!`)
-          .setThumbnail(message.author.displayAvatarURL()).setTimestamp()] });
+        await channel.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${message.guild.name}!`).setDescription(`Hey <@${message.author.id}>, you are member **#${message.guild.memberCount}**!`).setThumbnail(message.author.displayAvatarURL()).setTimestamp()] });
       }
       return message.reply(`✅ Test sent to ${channel}.`);
     }
@@ -521,8 +429,7 @@ client.on('messageCreate', async message => {
       if (message.guild.members.me.roles.highest.position <= role.position) return message.reply("❌ That role is above my highest role.");
       const roles = (await db.get(key)) || [];
       if (roles.includes(role.id)) return message.reply(`❌ **${role.name}** is already an autorole.`);
-      roles.push(role.id);
-      await db.set(key, roles);
+      roles.push(role.id); await db.set(key, roles);
       return message.reply(`✅ **${role.name}** will now be given to all new members.`);
     }
     if (sub === 'remove') {
@@ -535,13 +442,8 @@ client.on('messageCreate', async message => {
     if (sub === 'list') {
       const roles = (await db.get(key)) || [];
       if (!roles.length) return message.reply('❌ No autoroles set.');
-      const lines = roles.map(id => {
-        const r = message.guild.roles.cache.get(id);
-        return r ? `• ${r}` : `• Unknown (\`${id}\`)`;
-      });
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2)
-        .setTitle('🎭 Autoroles').setDescription(lines.join('\n'))
-        .setFooter({ text: `${roles.length} role(s)` })] });
+      const lines = roles.map(id => { const r = message.guild.roles.cache.get(id); return r ? `• ${r}` : `• Unknown (\`${id}\`)`; });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎭 Autoroles').setDescription(lines.join('\n')).setFooter({ text: `${roles.length} role(s)` })] });
     }
     message.reply('❌ Usage: `-autorole add @role` | `-autorole remove @role` | `-autorole list`');
   }
@@ -557,32 +459,24 @@ client.on('messageCreate', async message => {
     if (sub === 'enable') {
       await db.set(`antinuke.${gid}.enabled`, true);
       return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🛡️ Antinuke Enabled')
-        .setDescription('Protecting against:\n• Mass bans (3+ in 10s)\n• Mass kicks (3+ in 10s)\n• Mass channel deletes (3+ in 10s)\n• Mass role deletes (3+ in 10s)\n\nUse `-antinuke whitelist add @user` to trust your admins.')] });
+        .setDescription('Protecting against:\n• Mass bans (2+ in 8s)\n• Mass kicks (2+ in 8s)\n• Mass channel deletes (2+ in 8s)\n• Mass role deletes (2+ in 8s)\n\n⚠️ Make sure this bot has the **highest role** so it can ban nukers.\nUse `-antinuke whitelist add @user` to trust your admins.')] });
     }
-
-    if (sub === 'disable') {
-      await db.set(`antinuke.${gid}.enabled`, false);
-      return message.reply('✅ Antinuke disabled.');
-    }
-
+    if (sub === 'disable') { await db.set(`antinuke.${gid}.enabled`, false); return message.reply('✅ Antinuke disabled.'); }
     if (sub === 'setlog') {
       const ch = message.mentions.channels.first();
       if (!ch) return message.reply('❌ Usage: `-antinuke setlog #channel`');
       await db.set(`antinuke.${gid}.logChannel`, ch.id);
       return message.reply(`✅ Antinuke alerts will go to ${ch}.`);
     }
-
     if (sub === 'whitelist') {
       const action = args[1]?.toLowerCase();
       const user   = message.mentions.users.first();
-      if (!['add', 'remove'].includes(action) || !user)
-        return message.reply('❌ Usage: `-antinuke whitelist add @user` or `-antinuke whitelist remove @user`');
+      if (!['add', 'remove'].includes(action) || !user) return message.reply('❌ Usage: `-antinuke whitelist add @user` or `-antinuke whitelist remove @user`');
       const wlKey = `antinuke.${gid}.whitelist`;
-      let   list  = (await db.get(wlKey)) || [];
+      let list    = (await db.get(wlKey)) || [];
       if (action === 'add') {
         if (list.includes(user.id)) return message.reply(`❌ **${user.tag}** is already whitelisted.`);
-        list.push(user.id);
-        await db.set(wlKey, list);
+        list.push(user.id); await db.set(wlKey, list);
         return message.reply(`✅ **${user.tag}** added to the whitelist.`);
       } else {
         if (!list.includes(user.id)) return message.reply(`❌ **${user.tag}** is not whitelisted.`);
@@ -590,25 +484,22 @@ client.on('messageCreate', async message => {
         return message.reply(`✅ **${user.tag}** removed from the whitelist.`);
       }
     }
-
     if (sub === 'status') {
       const enabled  = await db.get(`antinuke.${gid}.enabled`);
       const wl       = (await db.get(`antinuke.${gid}.whitelist`)) || [];
       const logCh    = await db.get(`antinuke.${gid}.logChannel`);
-      const snapTime = await db.get(`snap.${gid}.time`);
       const snap     = (await db.get(`snap.${gid}`)) || [];
-      return message.reply({ embeds: [new EmbedBuilder().setColor(enabled ? 0x00cc44 : 0xff4444)
-        .setTitle('🛡️ Antinuke Status')
+      const snapTime = await db.get(`snap.${gid}.time`);
+      return message.reply({ embeds: [new EmbedBuilder().setColor(enabled ? 0x00cc44 : 0xff4444).setTitle('🛡️ Antinuke Status')
         .addFields(
-          { name: 'Status',        value: enabled ? '✅ Enabled' : '❌ Disabled',                   inline: true },
-          { name: 'Log Channel',   value: logCh ? `<#${logCh}>` : 'Not set',                       inline: true },
-          { name: 'Snapshot',      value: snapTime ? `${snap.length} channels saved • <t:${Math.floor(snapTime/1000)}:R>` : 'None yet', inline: false },
-          { name: 'Whitelist',     value: wl.length ? wl.map(id => `<@${id}>`).join(', ') : 'None' },
+          { name: 'Status',      value: enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+          { name: 'Log Channel', value: logCh ? `<#${logCh}>` : 'Not set',     inline: true },
+          { name: 'Snapshot',    value: snapTime ? `${snap.length} channels • <t:${Math.floor(snapTime/1000)}:R>` : 'None yet', inline: true },
+          { name: 'Whitelist',   value: wl.length ? wl.map(id => `<@${id}>`).join(', ') : 'None' },
         ).setTimestamp()] });
     }
 
     if (sub === 'restore') {
-      // -antinuke restore clear
       if (args[1]?.toLowerCase() === 'clear') {
         await db.delete(`snap.${gid}`);
         await db.delete(`snap.${gid}.time`);
@@ -617,76 +508,85 @@ client.on('messageCreate', async message => {
 
       const snap     = await db.get(`snap.${gid}`);
       const snapTime = await db.get(`snap.${gid}.time`);
-
       if (!snap || !snap.length)
-        return message.reply('❌ No snapshot found. A snapshot is taken automatically the first time a channel is deleted after a 30 second gap.');
+        return message.reply('❌ No snapshot found. One is taken automatically when the first channel is deleted.');
 
-      const status = await message.reply(`⏳ Cleaning up nuke damage and restoring **${snap.length}** channel(s)…`);
+      const status = await message.reply(`⏳ Cleaning up and restoring **${snap.length}** channel(s)…`);
 
       let nukeDeleted = 0, restored = 0, failed = 0;
 
-      // ── Step 1: delete channels the nuker created ─────────────────
-      // Any channel whose Discord creation time is on or after the
-      // snapshot time was made AFTER (or during) the nuke.
-      const nukeChannels = [...message.guild.channels.cache.values()]
-        .filter(ch => ch.createdTimestamp >= snapTime);
+      // ── Step 1: delete nuke-created channels ─────────────────────
+      // Any channel whose ID is NOT in the snapshot was created during
+      // the nuke. This is more reliable than timestamp comparison.
+      const snapIds    = new Set(snap.map(c => c.id));
+      const nukeChans  = [...message.guild.channels.cache.values()].filter(ch => !snapIds.has(ch.id));
 
-      for (const ch of nukeChannels) {
+      for (const ch of nukeChans) {
         await ch.delete('Antinuke restore: removing nuke-created channel').catch(() => {});
         nukeDeleted++;
       }
 
-      // Brief pause so Discord processes the deletes
-      await new Promise(r => setTimeout(r, 1500));
+      // Brief pause for Discord to process deletes
+      await new Promise(r => setTimeout(r, 2000));
 
-      // ── Step 2: recreate categories (type 4) first ────────────────
-      // Map old category ID → newly created category ID so channels
-      // can be placed back into the correct category.
-      const categoryMap = new Map();
+      // ── Step 2: recreate categories first ────────────────────────
+      const categoryMap = new Map(); // oldCategoryId → newCategoryId
 
       for (const ch of snap.filter(c => c.type === 4)) {
-        try {
-          const newCh = await message.guild.channels.create({
-            name:     ch.name,
-            type:     ch.type,
-            position: ch.position,
-            permissionOverwrites: ch.permissionOverwrites.map(p => ({
-              id: p.id, type: p.type,
-              allow: BigInt(p.allow), deny: BigInt(p.deny),
-            })),
-          });
-          // Map the OLD category ID to the NEW one
-          categoryMap.set(ch.id, newCh.id);
+        // Skip if already exists (wasn't deleted during nuke)
+        if (message.guild.channels.cache.some(c => c.name === ch.name && c.type === 4)) {
+          const existing = message.guild.channels.cache.find(c => c.name === ch.name && c.type === 4);
+          categoryMap.set(ch.id, existing.id);
+          continue;
+        }
+
+        const ok = await restoreChannel(message.guild, ch, {
+          name:     ch.name,
+          type:     ch.type,
+          position: ch.position,
+          permissionOverwrites: ch.permissionOverwrites.map(p => ({
+            id: p.id, type: p.type, allow: BigInt(p.allow), deny: BigInt(p.deny),
+          })),
+        });
+
+        if (ok) {
+          // Find the newly created category to get its new ID
+          const newCat = message.guild.channels.cache.find(c => c.name === ch.name && c.type === 4);
+          if (newCat) categoryMap.set(ch.id, newCat.id);
           restored++;
-        } catch { failed++; }
+        } else { failed++; }
+
+        await new Promise(r => setTimeout(r, 300)); // rate limit breathing room
       }
 
-      // ── Step 3: recreate all other channels ───────────────────────
+      // ── Step 3: recreate all other channels ──────────────────────
       for (const ch of snap.filter(c => c.type !== 4)) {
-        try {
-          // Look up the newly created category using the old parentId
-          const parentId = ch.parentId ? categoryMap.get(ch.parentId) : null;
+        // Skip if already exists
+        if (message.guild.channels.cache.some(c => c.name === ch.name && c.type === ch.type)) continue;
 
-          const opts = {
-            name:     ch.name,
-            type:     ch.type,
-            position: ch.position,
-            permissionOverwrites: ch.permissionOverwrites.map(p => ({
-              id: p.id, type: p.type,
-              allow: BigInt(p.allow), deny: BigInt(p.deny),
-            })),
-          };
+        // Map old parent category ID → new category ID
+        const parentId = ch.parentId ? categoryMap.get(ch.parentId) : null;
 
-          if (parentId)            opts.parent           = parentId;
-          if (ch.topic)            opts.topic            = ch.topic;
-          if (ch.nsfw)             opts.nsfw             = ch.nsfw;
-          if (ch.rateLimitPerUser) opts.rateLimitPerUser = ch.rateLimitPerUser;
-          if (ch.bitrate)          opts.bitrate          = ch.bitrate;
-          if (ch.userLimit)        opts.userLimit        = ch.userLimit;
+        const opts = {
+          name:     ch.name,
+          type:     ch.type,
+          position: ch.position,
+          permissionOverwrites: ch.permissionOverwrites.map(p => ({
+            id: p.id, type: p.type, allow: BigInt(p.allow), deny: BigInt(p.deny),
+          })),
+        };
 
-          await message.guild.channels.create(opts);
-          restored++;
-        } catch { failed++; }
+        if (parentId)            opts.parent           = parentId;
+        if (ch.topic)            opts.topic            = ch.topic;
+        if (ch.nsfw)             opts.nsfw             = ch.nsfw;
+        if (ch.rateLimitPerUser) opts.rateLimitPerUser = ch.rateLimitPerUser;
+        if (ch.bitrate)          opts.bitrate          = ch.bitrate;
+        if (ch.userLimit)        opts.userLimit        = ch.userLimit;
+
+        const ok = await restoreChannel(message.guild, ch, opts);
+        if (ok) restored++; else failed++;
+
+        await new Promise(r => setTimeout(r, 300)); // rate limit breathing room
       }
 
       await status.edit({ content: '', embeds: [new EmbedBuilder()
@@ -699,7 +599,6 @@ client.on('messageCreate', async message => {
         )
         .setFooter({ text: 'Run -antinuke restore clear to wipe the snapshot.' })
         .setTimestamp()] });
-
       return;
     }
 
