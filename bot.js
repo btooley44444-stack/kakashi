@@ -67,8 +67,8 @@ async function nukeLog(guild, msg) {
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   client.user.setPresence({
-    activities: [{ name: '.gg/rasengan', type: ActivityType.Watching }],
-    status: 'online',
+    activities: [{ name: '.gg/rasengan', type: ActivityType.Playing }],
+    status: 'dnd',
   });
 });
 
