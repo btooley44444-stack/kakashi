@@ -173,6 +173,65 @@ client.on('messageCreate', async message => {
   const args = message.content.slice(PREFIX.length).trim().split(/ +/);
   const cmd  = args.shift().toLowerCase();
 
+  // -cmds
+  if (cmd === 'cmds' || cmd === 'commands' || cmd === 'help') {
+    return message.reply({
+      embeds: [new EmbedBuilder().setColor(0x5865f2)
+        .setTitle('📋 Commands')
+        .addFields(
+          {
+            name: '🔨 Moderation',
+            value: [
+              '`-ban @user [reason]`',
+              '`-kick @user [reason]`',
+              '`-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`',
+              '`-warn @user <reason>`',
+              '`-warnings @user`',
+              '`-warnings clear @user`',
+              '`-purge <1-100>`',
+              '`-purge @user <1-100>`',
+            ].join('\n'),
+          },
+          {
+            name: '🎭 Roles',
+            value: [
+              '`-role add @user <role name>`',
+              '`-role remove @user <role name>`',
+            ].join('\n'),
+          },
+          {
+            name: '👋 Welcome',
+            value: [
+              '`-setwelcome #channel`',
+              '`-setwelcome message <text>`',
+              '`-setwelcome disable`',
+              '`-setwelcome test`',
+            ].join('\n'),
+          },
+          {
+            name: '⚙️ Config',
+            value: [
+              '`-autorole add @role`',
+              '`-autorole remove @role`',
+              '`-autorole list`',
+            ].join('\n'),
+          },
+          {
+            name: '🛡️ Antinuke (owner only)',
+            value: [
+              '`-antinuke enable`',
+              '`-antinuke disable`',
+              '`-antinuke setlog #channel`',
+              '`-antinuke whitelist add @user`',
+              '`-antinuke whitelist remove @user`',
+              '`-antinuke status`',
+            ].join('\n'),
+          },
+        )
+        .setFooter({ text: `Prefix: ${PREFIX}  •  Placeholders: {user} {username} {server} {memberCount}` })],
+    });
+  }
+
   // -ban @user [reason]
   if (cmd === 'ban') {
     if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
@@ -221,7 +280,7 @@ client.on('messageCreate', async message => {
       ).setTimestamp()] });
   }
 
-  // -timeout @user <60s|5m|10m|1h|1d|1w> [reason]
+  // -timeout @user <duration> [reason]
   else if (cmd === 'timeout' || cmd === 'mute') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
@@ -315,33 +374,60 @@ client.on('messageCreate', async message => {
     setTimeout(() => confirm.delete().catch(() => {}), 4000);
   }
 
-  // -role add/remove @user @role
+  // -role add/remove @user <role name>
   else if (cmd === 'role') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
       return message.reply('❌ You need **Manage Roles** permission.');
+
     const sub    = args[0]?.toLowerCase();
     const target = message.mentions.members.first();
-    const role   = message.mentions.roles.first();
-    if (!['add', 'remove'].includes(sub)) return message.reply('❌ Usage: `-role add @user @role` or `-role remove @user @role`');
-    if (!target) return message.reply('❌ Please mention a user.');
-    if (!role)   return message.reply('❌ Please mention a role.');
-    if (message.guild.members.me.roles.highest.position <= role.position) return message.reply("❌ That role is above my highest role.");
-    if (message.member.roles.highest.position <= role.position)           return message.reply("❌ That role is above your highest role.");
-    if (role.managed) return message.reply('❌ That role is managed by an integration.');
+
+    if (!['add', 'remove'].includes(sub))
+      return message.reply('❌ Usage: `-role add @user <role name>` or `-role remove @user <role name>`');
+    if (!target)
+      return message.reply('❌ Please mention a user. Example: `-role add @user member`');
+
+    // Role name is everything after the mention (args[1] onwards)
+    // args[0] = sub, args[1] = the raw mention text, args[2+] = role name
+    const roleName = args.slice(2).join(' ');
+    if (!roleName)
+      return message.reply('❌ Please provide a role name. Example: `-role add @user member`');
+
+    // Find role by name (case-insensitive) or by mention
+    const role = message.mentions.roles.first()
+      || message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+
+    if (!role)
+      return message.reply(`❌ Could not find a role named **${roleName}**. Check the spelling.`);
+    if (message.guild.members.me.roles.highest.position <= role.position)
+      return message.reply("❌ That role is above my highest role.");
+    if (message.member.roles.highest.position <= role.position)
+      return message.reply("❌ That role is above your highest role.");
+    if (role.managed)
+      return message.reply('❌ That role is managed by an integration.');
+
     if (sub === 'add') {
-      if (target.roles.cache.has(role.id)) return message.reply(`❌ ${target} already has **${role.name}**.`);
+      if (target.roles.cache.has(role.id))
+        return message.reply(`❌ ${target} already has **${role.name}**.`);
       await target.roles.add(role, `Added by ${message.author.tag}`);
       message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Role Added')
-        .addFields({ name: 'Member', value: `${target}`, inline: true }, { name: 'Role', value: `${role}`, inline: true })] });
+        .addFields(
+          { name: 'Member', value: `${target}`,    inline: true },
+          { name: 'Role',   value: `${role.name}`, inline: true },
+        )] });
     } else {
-      if (!target.roles.cache.has(role.id)) return message.reply(`❌ ${target} doesn't have **${role.name}**.`);
+      if (!target.roles.cache.has(role.id))
+        return message.reply(`❌ ${target} doesn't have **${role.name}**.`);
       await target.roles.remove(role, `Removed by ${message.author.tag}`);
       message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Role Removed')
-        .addFields({ name: 'Member', value: `${target}`, inline: true }, { name: 'Role', value: `${role}`, inline: true })] });
+        .addFields(
+          { name: 'Member', value: `${target}`,    inline: true },
+          { name: 'Role',   value: `${role.name}`, inline: true },
+        )] });
     }
   }
 
-  // -setwelcome #channel / message <text> / disable / test
+  // -setwelcome
   else if (cmd === 'setwelcome') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return message.reply('❌ You need **Manage Server** permission.');
@@ -387,7 +473,7 @@ client.on('messageCreate', async message => {
     message.reply('❌ Usage: `-setwelcome #channel` | `-setwelcome message <text>` | `-setwelcome disable` | `-setwelcome test`');
   }
 
-  // -autorole add/remove/list @role
+  // -autorole
   else if (cmd === 'autorole') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
       return message.reply('❌ You need **Manage Roles** permission.');
