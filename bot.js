@@ -128,23 +128,23 @@ client.on('guildBanAdd', async ban => {
 client.on('channelDelete', async channel => {
   if (!channel.guild) return;
 
-  // ── Snapshot the channel before it's gone ──
+  // ── Snapshot the channel ──────────────────────────────────────────
   try {
     const snapshot = {
-      id:                channel.id,       // needed to map old category → new one
-      name:              channel.name,
-      type:              channel.type,     // numeric channel type (4 = category, 0 = text, 2 = voice…)
-      parentId:          channel.parentId || null,
-      position:          channel.position,
-      topic:             channel.topic    || null,
-      nsfw:              channel.nsfw     || false,
-      rateLimitPerUser:  channel.rateLimitPerUser || 0,
-      bitrate:           channel.bitrate  || null,
-      userLimit:         channel.userLimit || null,
-      // Store permission overwrites as strings (BigInt can't go into JSON)
+      id:               channel.id,
+      name:             channel.name,
+      type:             channel.type,
+      parentId:         channel.parentId     || null,
+      position:         channel.position,
+      topic:            channel.topic        || null,
+      nsfw:             channel.nsfw         || false,
+      rateLimitPerUser: channel.rateLimitPerUser || 0,
+      bitrate:          channel.bitrate      || null,
+      userLimit:        channel.userLimit    || null,
+      deletedAt:        Date.now(),           // used to detect nuke start time
       permissionOverwrites: channel.permissionOverwrites.cache.map(p => ({
-        id:   p.id,
-        type: p.type,
+        id:    p.id,
+        type:  p.type,
         allow: p.allow.bitfield.toString(),
         deny:  p.deny.bitfield.toString(),
       })),
@@ -153,10 +153,10 @@ client.on('channelDelete', async channel => {
     const key   = `restorecache.${channel.guild.id}`;
     const cache = (await db.get(key)) || [];
     cache.unshift(snapshot);
-    await db.set(key, cache.slice(0, 100)); // keep last 100 deleted channels
+    await db.set(key, cache.slice(0, 100));
   } catch {}
 
-  // ── Antinuke check ──
+  // ── Antinuke check ────────────────────────────────────────────────
   try {
     const logs = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 1 });
     const exec = logs.entries.first()?.executor;
@@ -255,7 +255,7 @@ client.on('messageCreate', async message => {
               '`-antinuke setlog #channel`',
               '`-antinuke whitelist add/remove @user`',
               '`-antinuke status`',
-              '`-antinuke restore` — recreate deleted channels',
+              '`-antinuke restore` — delete nuke channels & rebuild originals',
               '`-antinuke restore clear` — clear the restore cache',
             ].join('\n'),
           },
@@ -578,14 +578,13 @@ client.on('messageCreate', async message => {
       return message.reply({ embeds: [new EmbedBuilder().setColor(enabled ? 0x00cc44 : 0xff4444)
         .setTitle('🛡️ Antinuke Status')
         .addFields(
-          { name: 'Status',         value: enabled ? '✅ Enabled' : '❌ Disabled',                   inline: true },
-          { name: 'Log Channel',    value: logCh ? `<#${logCh}>` : 'Not set',                       inline: true },
-          { name: 'Channel Cache',  value: `${cache.length} channel(s) saved`,                      inline: true },
-          { name: 'Whitelist',      value: wl.length ? wl.map(id => `<@${id}>`).join(', ') : 'None' },
+          { name: 'Status',        value: enabled ? '✅ Enabled' : '❌ Disabled',                   inline: true },
+          { name: 'Log Channel',   value: logCh ? `<#${logCh}>` : 'Not set',                       inline: true },
+          { name: 'Channel Cache', value: `${cache.length} saved`,                                  inline: true },
+          { name: 'Whitelist',     value: wl.length ? wl.map(id => `<@${id}>`).join(', ') : 'None' },
         ).setTimestamp()] });
     }
 
-    // -antinuke restore  /  -antinuke restore clear
     if (sub === 'restore') {
       const cacheKey = `restorecache.${gid}`;
 
@@ -597,39 +596,54 @@ client.on('messageCreate', async message => {
 
       const cache = (await db.get(cacheKey)) || [];
       if (!cache.length)
-        return message.reply('❌ No deleted channels in the cache. Channels are saved automatically when deleted.');
+        return message.reply('❌ No deleted channels in the cache. Channels are saved automatically whenever they are deleted.');
 
-      const status = await message.reply(`⏳ Restoring **${cache.length}** channel(s)...`);
+      // Work out when the nuke began — the earliest deletedAt in the cache.
+      // Any channel that was CREATED after that moment was made by the nuker.
+      const nukeStartTime = Math.min(...cache.map(c => c.deletedAt));
 
-      let restored = 0;
-      let failed   = 0;
+      const status = await message.reply(`⏳ Cleaning up nuke damage and restoring **${cache.length}** channel(s)…`);
 
-      // Map old category IDs → newly created category IDs
-      const categoryMap = new Map();
+      let nukeDeleted = 0;
+      let restored    = 0;
+      let failed      = 0;
 
-      // ── Pass 1: recreate categories first (type 4) ──
+      // ── Step 1: delete channels the nuker created ─────────────────
+      // These are any channels whose Discord creation timestamp is >= nukeStartTime
+      const nukeChannels = [...message.guild.channels.cache.values()]
+        .filter(ch => ch.createdTimestamp >= nukeStartTime);
+
+      for (const ch of nukeChannels) {
+        await ch.delete('Antinuke restore: removing nuke-created channel').catch(() => {});
+        nukeDeleted++;
+      }
+
+      // Small pause so Discord can process the deletes before we recreate
+      await new Promise(r => setTimeout(r, 1500));
+
+      // ── Step 2: recreate categories first (type 4) ────────────────
+      const categoryMap = new Map(); // old channel ID → new channel ID
+
       for (const ch of cache.filter(c => c.type === 4)) {
         try {
           const newCh = await message.guild.channels.create({
-            name: ch.name,
-            type: ch.type,
+            name:     ch.name,
+            type:     ch.type,
             position: ch.position,
             permissionOverwrites: ch.permissionOverwrites.map(p => ({
-              id:    p.id,
-              type:  p.type,
-              allow: BigInt(p.allow),
-              deny:  BigInt(p.deny),
+              id: p.id, type: p.type,
+              allow: BigInt(p.allow), deny: BigInt(p.deny),
             })),
           });
-          categoryMap.set(ch.id, newCh.id); // old ID → new ID
+          categoryMap.set(ch.id, newCh.id);
           restored++;
         } catch { failed++; }
       }
 
-      // ── Pass 2: recreate all other channels ──
+      // ── Step 3: recreate all other channels ───────────────────────
       for (const ch of cache.filter(c => c.type !== 4)) {
         try {
-          // If the channel was inside a category, map to the newly recreated one
+          // If this channel was inside a category, map to the newly created one
           const parentId = ch.parentId
             ? (categoryMap.get(ch.parentId) || ch.parentId)
             : null;
@@ -639,10 +653,8 @@ client.on('messageCreate', async message => {
             type:     ch.type,
             position: ch.position,
             permissionOverwrites: ch.permissionOverwrites.map(p => ({
-              id:    p.id,
-              type:  p.type,
-              allow: BigInt(p.allow),
-              deny:  BigInt(p.deny),
+              id: p.id, type: p.type,
+              allow: BigInt(p.allow), deny: BigInt(p.deny),
             })),
           };
 
@@ -660,12 +672,13 @@ client.on('messageCreate', async message => {
 
       await status.edit({ content: '', embeds: [new EmbedBuilder()
         .setColor(failed === 0 ? 0x00cc44 : 0xffcc00)
-        .setTitle('🔁 Channel Restore Complete')
+        .setTitle('🔁 Restore Complete')
         .addFields(
-          { name: '✅ Restored', value: String(restored), inline: true },
-          { name: '❌ Failed',   value: String(failed),   inline: true },
+          { name: '🗑️ Nuke channels removed', value: String(nukeDeleted), inline: true },
+          { name: '✅ Channels restored',      value: String(restored),    inline: true },
+          { name: '❌ Failed',                 value: String(failed),      inline: true },
         )
-        .setDescription(failed > 0 ? 'Some channels could not be restored (they may use unsupported types or have permission issues).' : null)
+        .setFooter({ text: 'Run -antinuke restore clear to wipe the cache.' })
         .setTimestamp()] });
 
       return;
