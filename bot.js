@@ -67,8 +67,8 @@ async function nukeLog(guild, msg) {
 client.once('ready', () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   client.user.setPresence({
-    activities: [{ name: '.gg/rasengan', type: ActivityType.Playing }],
-    status: 'dnd',
+    activities: [{ name: '.gg/rasengan', type: ActivityType.Watching }],
+    status: 'online',
   });
 });
 
@@ -124,8 +124,39 @@ client.on('guildBanAdd', async ban => {
   } catch {}
 });
 
+// Save every deleted channel so we can restore it later
 client.on('channelDelete', async channel => {
   if (!channel.guild) return;
+
+  // ── Snapshot the channel before it's gone ──
+  try {
+    const snapshot = {
+      id:                channel.id,       // needed to map old category → new one
+      name:              channel.name,
+      type:              channel.type,     // numeric channel type (4 = category, 0 = text, 2 = voice…)
+      parentId:          channel.parentId || null,
+      position:          channel.position,
+      topic:             channel.topic    || null,
+      nsfw:              channel.nsfw     || false,
+      rateLimitPerUser:  channel.rateLimitPerUser || 0,
+      bitrate:           channel.bitrate  || null,
+      userLimit:         channel.userLimit || null,
+      // Store permission overwrites as strings (BigInt can't go into JSON)
+      permissionOverwrites: channel.permissionOverwrites.cache.map(p => ({
+        id:   p.id,
+        type: p.type,
+        allow: p.allow.bitfield.toString(),
+        deny:  p.deny.bitfield.toString(),
+      })),
+    };
+
+    const key   = `restorecache.${channel.guild.id}`;
+    const cache = (await db.get(key)) || [];
+    cache.unshift(snapshot);
+    await db.set(key, cache.slice(0, 100)); // keep last 100 deleted channels
+  } catch {}
+
+  // ── Antinuke check ──
   try {
     const logs = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.ChannelDelete, limit: 1 });
     const exec = logs.entries.first()?.executor;
@@ -222,13 +253,14 @@ client.on('messageCreate', async message => {
               '`-antinuke enable`',
               '`-antinuke disable`',
               '`-antinuke setlog #channel`',
-              '`-antinuke whitelist add @user`',
-              '`-antinuke whitelist remove @user`',
+              '`-antinuke whitelist add/remove @user`',
               '`-antinuke status`',
+              '`-antinuke restore` — recreate deleted channels',
+              '`-antinuke restore clear` — clear the restore cache',
             ].join('\n'),
           },
         )
-        .setFooter({ text: `Prefix: ${PREFIX}  •  Placeholders: {user} {username} {server} {memberCount}` })],
+        .setFooter({ text: `Prefix: ${PREFIX}  •  Welcome placeholders: {user} {username} {server} {memberCount}` })],
     });
   }
 
@@ -378,52 +410,35 @@ client.on('messageCreate', async message => {
   else if (cmd === 'role') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
       return message.reply('❌ You need **Manage Roles** permission.');
-
     const sub    = args[0]?.toLowerCase();
     const target = message.mentions.members.first();
-
     if (!['add', 'remove'].includes(sub))
       return message.reply('❌ Usage: `-role add @user <role name>` or `-role remove @user <role name>`');
     if (!target)
       return message.reply('❌ Please mention a user. Example: `-role add @user member`');
-
-    // Role name is everything after the mention (args[1] onwards)
-    // args[0] = sub, args[1] = the raw mention text, args[2+] = role name
     const roleName = args.slice(2).join(' ');
     if (!roleName)
       return message.reply('❌ Please provide a role name. Example: `-role add @user member`');
-
-    // Find role by name (case-insensitive) or by mention
     const role = message.mentions.roles.first()
       || message.guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
-
     if (!role)
-      return message.reply(`❌ Could not find a role named **${roleName}**. Check the spelling.`);
+      return message.reply(`❌ Could not find a role named **${roleName}**.`);
     if (message.guild.members.me.roles.highest.position <= role.position)
       return message.reply("❌ That role is above my highest role.");
     if (message.member.roles.highest.position <= role.position)
       return message.reply("❌ That role is above your highest role.");
     if (role.managed)
       return message.reply('❌ That role is managed by an integration.');
-
     if (sub === 'add') {
-      if (target.roles.cache.has(role.id))
-        return message.reply(`❌ ${target} already has **${role.name}**.`);
+      if (target.roles.cache.has(role.id)) return message.reply(`❌ ${target} already has **${role.name}**.`);
       await target.roles.add(role, `Added by ${message.author.tag}`);
       message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Role Added')
-        .addFields(
-          { name: 'Member', value: `${target}`,    inline: true },
-          { name: 'Role',   value: `${role.name}`, inline: true },
-        )] });
+        .addFields({ name: 'Member', value: `${target}`, inline: true }, { name: 'Role', value: role.name, inline: true })] });
     } else {
-      if (!target.roles.cache.has(role.id))
-        return message.reply(`❌ ${target} doesn't have **${role.name}**.`);
+      if (!target.roles.cache.has(role.id)) return message.reply(`❌ ${target} doesn't have **${role.name}**.`);
       await target.roles.remove(role, `Removed by ${message.author.tag}`);
       message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Role Removed')
-        .addFields(
-          { name: 'Member', value: `${target}`,    inline: true },
-          { name: 'Role',   value: `${role.name}`, inline: true },
-        )] });
+        .addFields({ name: 'Member', value: `${target}`, inline: true }, { name: 'Role', value: role.name, inline: true })] });
     }
   }
 
@@ -514,23 +529,28 @@ client.on('messageCreate', async message => {
   else if (cmd === 'antinuke' || cmd === 'an') {
     if (message.author.id !== message.guild.ownerId)
       return message.reply('❌ Only the **server owner** can manage antinuke.');
+
     const sub = args[0]?.toLowerCase();
     const gid = message.guild.id;
+
     if (sub === 'enable') {
       await db.set(`antinuke.${gid}.enabled`, true);
       return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🛡️ Antinuke Enabled')
         .setDescription('Protecting against:\n• Mass bans (3+ in 10s)\n• Mass kicks (3+ in 10s)\n• Mass channel deletes (3+ in 10s)\n• Mass role deletes (3+ in 10s)\n\nUse `-antinuke whitelist add @user` to trust your admins.')] });
     }
+
     if (sub === 'disable') {
       await db.set(`antinuke.${gid}.enabled`, false);
       return message.reply('✅ Antinuke disabled.');
     }
+
     if (sub === 'setlog') {
       const ch = message.mentions.channels.first();
       if (!ch) return message.reply('❌ Usage: `-antinuke setlog #channel`');
       await db.set(`antinuke.${gid}.logChannel`, ch.id);
       return message.reply(`✅ Antinuke alerts will go to ${ch}.`);
     }
+
     if (sub === 'whitelist') {
       const action = args[1]?.toLowerCase();
       const user   = message.mentions.users.first();
@@ -549,19 +569,109 @@ client.on('messageCreate', async message => {
         return message.reply(`✅ **${user.tag}** removed from the whitelist.`);
       }
     }
+
     if (sub === 'status') {
       const enabled = await db.get(`antinuke.${gid}.enabled`);
       const wl      = (await db.get(`antinuke.${gid}.whitelist`)) || [];
       const logCh   = await db.get(`antinuke.${gid}.logChannel`);
+      const cache   = (await db.get(`restorecache.${gid}`)) || [];
       return message.reply({ embeds: [new EmbedBuilder().setColor(enabled ? 0x00cc44 : 0xff4444)
         .setTitle('🛡️ Antinuke Status')
         .addFields(
-          { name: 'Status',      value: enabled ? '✅ Enabled' : '❌ Disabled',                   inline: true },
-          { name: 'Log Channel', value: logCh ? `<#${logCh}>` : 'Not set',                       inline: true },
-          { name: 'Whitelist',   value: wl.length ? wl.map(id => `<@${id}>`).join(', ') : 'None' },
+          { name: 'Status',         value: enabled ? '✅ Enabled' : '❌ Disabled',                   inline: true },
+          { name: 'Log Channel',    value: logCh ? `<#${logCh}>` : 'Not set',                       inline: true },
+          { name: 'Channel Cache',  value: `${cache.length} channel(s) saved`,                      inline: true },
+          { name: 'Whitelist',      value: wl.length ? wl.map(id => `<@${id}>`).join(', ') : 'None' },
         ).setTimestamp()] });
     }
-    message.reply('❌ Usage: `-antinuke enable` | `disable` | `setlog #ch` | `whitelist add/remove @user` | `status`');
+
+    // -antinuke restore  /  -antinuke restore clear
+    if (sub === 'restore') {
+      const cacheKey = `restorecache.${gid}`;
+
+      // -antinuke restore clear
+      if (args[1]?.toLowerCase() === 'clear') {
+        await db.delete(cacheKey);
+        return message.reply('✅ Channel restore cache cleared.');
+      }
+
+      const cache = (await db.get(cacheKey)) || [];
+      if (!cache.length)
+        return message.reply('❌ No deleted channels in the cache. Channels are saved automatically when deleted.');
+
+      const status = await message.reply(`⏳ Restoring **${cache.length}** channel(s)...`);
+
+      let restored = 0;
+      let failed   = 0;
+
+      // Map old category IDs → newly created category IDs
+      const categoryMap = new Map();
+
+      // ── Pass 1: recreate categories first (type 4) ──
+      for (const ch of cache.filter(c => c.type === 4)) {
+        try {
+          const newCh = await message.guild.channels.create({
+            name: ch.name,
+            type: ch.type,
+            position: ch.position,
+            permissionOverwrites: ch.permissionOverwrites.map(p => ({
+              id:    p.id,
+              type:  p.type,
+              allow: BigInt(p.allow),
+              deny:  BigInt(p.deny),
+            })),
+          });
+          categoryMap.set(ch.id, newCh.id); // old ID → new ID
+          restored++;
+        } catch { failed++; }
+      }
+
+      // ── Pass 2: recreate all other channels ──
+      for (const ch of cache.filter(c => c.type !== 4)) {
+        try {
+          // If the channel was inside a category, map to the newly recreated one
+          const parentId = ch.parentId
+            ? (categoryMap.get(ch.parentId) || ch.parentId)
+            : null;
+
+          const opts = {
+            name:     ch.name,
+            type:     ch.type,
+            position: ch.position,
+            permissionOverwrites: ch.permissionOverwrites.map(p => ({
+              id:    p.id,
+              type:  p.type,
+              allow: BigInt(p.allow),
+              deny:  BigInt(p.deny),
+            })),
+          };
+
+          if (parentId)            opts.parent           = parentId;
+          if (ch.topic)            opts.topic            = ch.topic;
+          if (ch.nsfw)             opts.nsfw             = ch.nsfw;
+          if (ch.rateLimitPerUser) opts.rateLimitPerUser = ch.rateLimitPerUser;
+          if (ch.bitrate)          opts.bitrate          = ch.bitrate;
+          if (ch.userLimit)        opts.userLimit        = ch.userLimit;
+
+          await message.guild.channels.create(opts);
+          restored++;
+        } catch { failed++; }
+      }
+
+      await status.edit({ content: '', embeds: [new EmbedBuilder()
+        .setColor(failed === 0 ? 0x00cc44 : 0xffcc00)
+        .setTitle('🔁 Channel Restore Complete')
+        .addFields(
+          { name: '✅ Restored', value: String(restored), inline: true },
+          { name: '❌ Failed',   value: String(failed),   inline: true },
+        )
+        .setDescription(failed > 0 ? 'Some channels could not be restored (they may use unsupported types or have permission issues).' : null)
+        .setTimestamp()] });
+
+      return;
+    }
+
+    message.reply('❌ Usage: `-antinuke enable` | `disable` | `setlog #ch` | `whitelist add/remove @user` | `status` | `restore` | `restore clear`');
   }
 });
 
