@@ -24,6 +24,46 @@ const client  = new Client({
 //  GIVEAWAY HELPERS
 // ─────────────────────────────────────────────
 const giveawayTimers = new Map(); // messageId -> timeout handle
+const muteTimers     = new Map(); // `${guildId}:${userId}` -> timeout handle
+
+// ─────────────────────────────────────────────
+//  MUTE ROLE HELPER
+// ─────────────────────────────────────────────
+async function getMuteRole(guild) {
+  let role = guild.roles.cache.find(r => r.name === 'Muted');
+  if (!role) {
+    role = await guild.roles.create({
+      name: 'Muted',
+      color: 0x808080,
+      permissions: [],
+      reason: 'Auto-created for -mute command',
+    });
+    // Apply deny overwrites to every text channel
+    for (const ch of guild.channels.cache.values()) {
+      if (ch.isTextBased() || ch.type === 2) {
+        await ch.permissionOverwrites.edit(role, {
+          SendMessages:           false,
+          SendMessagesInThreads:  false,
+          AddReactions:           false,
+          Speak:                  false,
+        }).catch(() => {});
+      }
+    }
+    console.log(`[mute] Created Muted role in ${guild.name}`);
+  }
+  return role;
+}
+
+async function unmuteUser(guild, userId, reason) {
+  const muteRole = guild.roles.cache.find(r => r.name === 'Muted');
+  if (!muteRole) return;
+  const member = await guild.members.fetch(userId).catch(() => null);
+  if (member?.roles.cache.has(muteRole.id)) {
+    await member.roles.remove(muteRole, reason).catch(() => {});
+  }
+  await db.delete(`mutes.${guild.id}.${userId}`);
+  muteTimers.delete(`${guild.id}:${userId}`);
+}
 
 function parseDuration(str) {
   const units = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
@@ -344,6 +384,26 @@ client.once('ready', async () => {
     }
   } catch {}
 
+  // Reschedule any mutes that were active when bot restarted
+  try {
+    const muteKeys = await db.list('mutes.');
+    for (const key of (muteKeys?.keys ?? [])) {
+      const data = await db.get(key);
+      if (!data) continue;
+      const parts   = key.split('.');
+      const guildId = parts[1], userId = parts[2];
+      const guild   = client.guilds.cache.get(guildId);
+      if (!guild) continue;
+      const remaining = data.endsAt - Date.now();
+      if (remaining <= 0) {
+        await unmuteUser(guild, userId, 'Mute expired');
+      } else {
+        const timer = setTimeout(() => unmuteUser(guild, userId, 'Mute expired'), remaining);
+        muteTimers.set(`${guildId}:${userId}`, timer);
+      }
+    }
+  } catch {}
+
   setInterval(async () => {
     for (const guild of client.guilds.cache.values()) {
       try {
@@ -359,6 +419,21 @@ client.once('ready', async () => {
 
 // Cache invites when bot joins a new guild
 client.on('guildCreate', guild => cacheInvites(guild));
+
+// Apply Muted role overwrites to newly created channels
+client.on('channelCreate', async channel => {
+  if (!channel.guild) return;
+  const muteRole = channel.guild.roles.cache.find(r => r.name === 'Muted');
+  if (!muteRole) return;
+  if (channel.isTextBased() || channel.type === 2) {
+    await channel.permissionOverwrites.edit(muteRole, {
+      SendMessages:           false,
+      SendMessagesInThreads:  false,
+      AddReactions:           false,
+      Speak:                  false,
+    }).catch(() => {});
+  }
+});
 
 // Keep invite cache fresh when invites are created/deleted
 client.on('inviteCreate', invite => {
@@ -590,7 +665,7 @@ client.on('messageCreate', async message => {
   if (cmd === 'cmds' || cmd === 'commands' || cmd === 'help') {
     return message.reply({
       embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Commands').addFields(
-        { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`\n`-unmute @user`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`\n`-lock [#channel] [reason]`\n`-unlock [#channel] [reason]`' },
+        { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-mute @user <duration> [reason]`\n`-unmute @user`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`\n`-lock [reason]`\n`-unlock [reason]`' },
         { name: '🎭 Roles',      value: '`-role add @user <name>`\n`-role remove @user <name>`' },
         { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset someone\'s count (admin)' },
         { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`\n\nPlaceholders: `{user}` `{username}` `{server}` `{memberCount}` `{inviter}` `{inviterTag}` `{inviterCount}`' },
@@ -692,32 +767,44 @@ client.on('messageCreate', async message => {
     message.reply({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle('👢 Kicked').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
   }
 
-  // ── -timeout ───────────────────────────────────────────────────
-  else if (cmd === 'timeout' || cmd === 'mute') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
-      return message.reply('❌ You need **Timeout Members** permission.');
+  // ── -mute ─────────────────────────────────────────────────────
+  else if (cmd === 'mute') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
+      return message.reply('❌ You need **Manage Roles** permission.');
     const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
-    if (!t) return message.reply('❌ Usage: `-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`');
-    const dur = { '60s': 60, '5m': 300, '10m': 600, '1h': 3600, '1d': 86400, '1w': 604800 };
-    const dk = args[1]?.toLowerCase(), secs = dur[dk];
-    if (!secs) return message.reply('❌ Duration: `60s` `5m` `10m` `1h` `1d` `1w`');
+    if (!t) return message.reply('❌ Usage: `-mute @user <duration> [reason]`\nDurations: `30s` `5m` `1h` `12h` `1d` `7d`');
+    const durArg = args[1]?.toLowerCase();
+    const ms = parseDuration(durArg);
+    if (!ms) return message.reply('❌ Invalid duration. Examples: `30s` `5m` `1h` `12h` `1d` `7d`');
     const r = args.slice(2).join(' ') || 'No reason provided';
-    if (!t.moderatable) return message.reply("❌ I can't timeout that user.");
+    if (t.id === message.author.id) return message.reply('❌ Cannot mute yourself.');
+    if (t.id === message.guild.ownerId) return message.reply('❌ Cannot mute the server owner.');
     if (message.member.roles.highest.position <= t.roles.highest.position)
       return message.reply('❌ That user has an equal or higher role.');
-    await t.timeout(secs * 1000, `${message.author.tag}: ${r}`);
-    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('⏱️ Timed Out').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Duration', value: dk, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
+    const muteRole = await getMuteRole(message.guild).catch(() => null);
+    if (!muteRole) return message.reply('❌ Failed to create/find the Muted role.');
+    if (message.guild.members.me.roles.highest.position <= muteRole.position)
+      return message.reply('❌ The Muted role is above my highest role — move it below my role.');
+    if (t.roles.cache.has(muteRole.id)) return message.reply('❌ That user is already muted.');
+    await t.roles.add(muteRole, `Muted by ${message.author.tag}: ${r}`);
+    const endsAt = Date.now() + ms;
+    await db.set(`mutes.${message.guild.id}.${t.id}`, { endsAt, reason: r, moderatorId: message.author.id });
+    const timer = setTimeout(() => unmuteUser(message.guild, t.id, 'Mute expired'), ms);
+    muteTimers.set(`${message.guild.id}:${t.id}`, timer);
+    await t.send({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle(`Muted in ${message.guild.name}`).addFields({ name: 'Duration', value: formatDuration(ms) }, { name: 'Reason', value: r })] }).catch(() => {});
+    message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('🔇 Muted').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Duration', value: formatDuration(ms), inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
   }
 
   // ── -unmute ────────────────────────────────────────────────────
-  else if (cmd === 'unmute' || cmd === 'untimeout') {
-    if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
-      return message.reply('❌ You need **Timeout Members** permission.');
+  else if (cmd === 'unmute') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
+      return message.reply('❌ You need **Manage Roles** permission.');
     const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
     if (!t) return message.reply('❌ Usage: `-unmute @user`');
-    if (!t.isCommunicationDisabled()) return message.reply('❌ That user is not timed out.');
-    if (!t.moderatable) return message.reply("❌ I can't unmute that user.");
-    await t.timeout(null, `Unmuted by ${message.author.tag}`);
+    const muteRole = message.guild.roles.cache.find(r => r.name === 'Muted');
+    if (!muteRole || !t.roles.cache.has(muteRole.id)) return message.reply('❌ That user is not muted.');
+    clearTimeout(muteTimers.get(`${message.guild.id}:${t.id}`));
+    await unmuteUser(message.guild, t.id, `Unmuted by ${message.author.tag}`);
     message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔊 Unmuted').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }).setTimestamp()] });
   }
 
@@ -778,17 +865,62 @@ client.on('messageCreate', async message => {
   else if (cmd === 'lock' || cmd === 'unlock') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels))
       return message.reply('❌ You need **Manage Channels** permission.');
-    const ch = message.mentions.channels.first() ?? message.channel;
-    if (!ch.isTextBased()) return message.reply('❌ That channel cannot be locked.');
+    const ch       = message.channel;
     const everyone = message.guild.roles.everyone;
-    const reason   = args.filter(a => !a.startsWith('<')).join(' ') || 'No reason provided';
+    const reason   = args.join(' ') || 'No reason provided';
+    const bypassIds = (await db.get(`lockwhitelist.${message.guild.id}`)) || [];
+    const bypassRoles = bypassIds
+      .map(id => message.guild.roles.cache.get(id))
+      .filter(Boolean);
     if (cmd === 'lock') {
       await ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: `Locked by ${message.author.tag}: ${reason}` });
-      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔒 Channel Locked').addFields({ name: 'Channel', value: `${ch}`, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
+      for (const role of bypassRoles) {
+        await ch.permissionOverwrites.edit(role, { SendMessages: true }, { reason: 'Lock whitelist bypass' }).catch(() => {});
+      }
+      const bypassLine = bypassRoles.length ? `\nWhitelisted roles can still type.` : '';
+      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔒 Channel Locked').setDescription(`Everyone cannot send messages.${bypassLine}`).addFields({ name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
     } else {
       await ch.permissionOverwrites.edit(everyone, { SendMessages: null }, { reason: `Unlocked by ${message.author.tag}: ${reason}` });
-      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔓 Channel Unlocked').addFields({ name: 'Channel', value: `${ch}`, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
+      for (const role of bypassRoles) {
+        await ch.permissionOverwrites.edit(role, { SendMessages: null }, { reason: 'Lock removed' }).catch(() => {});
+      }
+      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔓 Channel Unlocked').addFields({ name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
     }
+  }
+
+  // ── -whitelist ─────────────────────────────────────────────────
+  else if (cmd === 'whitelist') {
+    const sub = args[0]?.toLowerCase();
+    if (sub !== 'lock') return message.reply('❌ Usage: `-whitelist lock add/remove/list @role`');
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    const action = args[1]?.toLowerCase();
+    const role   = message.mentions.roles.first();
+    const key    = `lockwhitelist.${message.guild.id}`;
+    const list   = (await db.get(key)) || [];
+
+    if (action === 'add') {
+      if (!role) return message.reply('❌ Usage: `-whitelist lock add @role`');
+      if (list.includes(role.id)) return message.reply(`❌ ${role} is already on the lock whitelist.`);
+      list.push(role.id);
+      await db.set(key, list);
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Lock Whitelist Updated').setDescription(`${role} will now be able to type in locked channels.`)] });
+    }
+    if (action === 'remove') {
+      if (!role) return message.reply('❌ Usage: `-whitelist lock remove @role`');
+      if (!list.includes(role.id)) return message.reply(`❌ ${role} is not on the lock whitelist.`);
+      await db.set(key, list.filter(id => id !== role.id));
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Lock Whitelist Updated').setDescription(`${role} will now be affected by locks.`)] });
+    }
+    if (action === 'list') {
+      if (!list.length) return message.reply('❌ No roles on the lock whitelist.');
+      const lines = list.map(id => {
+        const r = message.guild.roles.cache.get(id);
+        return r ? `• ${r}` : `• Unknown role (${id})`;
+      });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🔒 Lock Whitelist').setDescription(lines.join('\n')).setFooter({ text: `${list.length} role(s)` })] });
+    }
+    message.reply('❌ Usage: `-whitelist lock add/remove/list @role`');
   }
 
   // ── -role ──────────────────────────────────────────────────────
