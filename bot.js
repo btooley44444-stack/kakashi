@@ -29,7 +29,9 @@ function parseDuration(str) {
   const units = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
   const match  = str.match(/^(\d+)(s|m|h|d)$/i);
   if (!match) return null;
-  return parseInt(match[1]) * units[match[2].toLowerCase()];
+  const ms = parseInt(match[1]) * units[match[2].toLowerCase()];
+  if (ms < 1000 || ms > 7 * 86400000) return null; // 1s min, 7d max
+  return ms;
 }
 
 function formatDuration(ms) {
@@ -567,7 +569,7 @@ client.on('messageCreate', async message => {
         { name: '🎭 Roles',      value: '`-role add @user <name>`\n`-role remove @user <name>`' },
         { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset someone\'s count (admin)' },
         { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`\n\nPlaceholders: `{user}` `{username}` `{server}` `{memberCount}` `{inviter}` `{inviterTag}` `{inviterCount}`' },
-        { name: '🎉 Giveaways',   value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nDurations: `30s` `10m` `1h` `12h` `1d` `7d`' },
+        { name: '🎉 Giveaways',   value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nAny duration from `1s` to `7d`' },
         { name: '⚙️ Config',     value: '`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
         { name: '🛡️ Antinuke (owner only)', value: '`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke snapshot` — manually save snapshot\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
       ).setFooter({ text: `Prefix: ${PREFIX}  •  Snapshot auto-saves every 30s` })],
@@ -878,7 +880,7 @@ client.on('messageCreate', async message => {
       return message.reply('❌ You need **Manage Server** permission.');
     // Usage: -gcreate <duration> <winners> <prize>
     const duration = parseDuration(args[0]);
-    if (!duration) return message.reply('❌ Usage: `-gcreate <duration> <winners> <prize>`\nDurations: `30s` `10m` `1h` `12h` `1d` `7d`');
+    if (!duration) return message.reply('❌ Usage: `-gcreate <duration> <winners> <prize>`\nAnything from `1s` to `7d` — e.g. `30s`, `5m`, `2h`, `3d`');
     const winnerCount = parseInt(args[1]);
     if (isNaN(winnerCount) || winnerCount < 1 || winnerCount > 20)
       return message.reply('❌ Winners must be a number between 1 and 20.');
