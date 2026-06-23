@@ -450,7 +450,7 @@ client.on('messageCreate', async message => {
   if (cmd === 'cmds' || cmd === 'commands' || cmd === 'help') {
     return message.reply({
       embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Commands').addFields(
-        { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`' },
+        { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`\n`-unmute @user`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`\n`-lock [#channel] [reason]`\n`-unlock [#channel] [reason]`' },
         { name: '🎭 Roles',      value: '`-role add @user <name>`\n`-role remove @user <name>`' },
         { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset someone\'s count (admin)' },
         { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`\n\nPlaceholders: `{user}` `{username}` `{server}` `{memberCount}` `{inviter}` `{inviterTag}` `{inviterCount}`' },
@@ -568,6 +568,18 @@ client.on('messageCreate', async message => {
     message.reply({ embeds: [new EmbedBuilder().setColor(0xffcc00).setTitle('⏱️ Timed Out').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Duration', value: dk, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
   }
 
+  // ── -unmute ────────────────────────────────────────────────────
+  else if (cmd === 'unmute' || cmd === 'untimeout') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
+      return message.reply('❌ You need **Timeout Members** permission.');
+    const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
+    if (!t) return message.reply('❌ Usage: `-unmute @user`');
+    if (!t.isCommunicationDisabled()) return message.reply('❌ That user is not timed out.');
+    if (!t.moderatable) return message.reply("❌ I can't unmute that user.");
+    await t.timeout(null, `Unmuted by ${message.author.tag}`);
+    message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔊 Unmuted').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }).setTimestamp()] });
+  }
+
   // ── -warn ──────────────────────────────────────────────────────
   else if (cmd === 'warn') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
@@ -619,6 +631,23 @@ client.on('messageCreate', async message => {
     const deleted = await message.channel.bulkDelete(toDelete, true);
     const conf = await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription(`🗑️ Deleted **${deleted.size}** messages.`)] });
     setTimeout(() => conf.delete().catch(() => {}), 4000);
+  }
+
+  // ── -lock / -unlock ────────────────────────────────────────────
+  else if (cmd === 'lock' || cmd === 'unlock') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels))
+      return message.reply('❌ You need **Manage Channels** permission.');
+    const ch = message.mentions.channels.first() ?? message.channel;
+    if (!ch.isTextBased()) return message.reply('❌ That channel cannot be locked.');
+    const everyone = message.guild.roles.everyone;
+    const reason   = args.filter(a => !a.startsWith('<')).join(' ') || 'No reason provided';
+    if (cmd === 'lock') {
+      await ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: `Locked by ${message.author.tag}: ${reason}` });
+      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔒 Channel Locked').addFields({ name: 'Channel', value: `${ch}`, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
+    } else {
+      await ch.permissionOverwrites.edit(everyone, { SendMessages: null }, { reason: `Unlocked by ${message.author.tag}: ${reason}` });
+      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔓 Channel Unlocked').addFields({ name: 'Channel', value: `${ch}`, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
+    }
   }
 
   // ── -role ──────────────────────────────────────────────────────
