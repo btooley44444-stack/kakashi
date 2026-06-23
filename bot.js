@@ -867,24 +867,23 @@ client.on('messageCreate', async message => {
       return message.reply('❌ You need **Manage Channels** permission.');
     const ch       = message.channel;
     const everyone = message.guild.roles.everyone;
-    const reason   = args.join(' ') || 'No reason provided';
     const bypassIds = (await db.get(`lockwhitelist.${message.guild.id}`)) || [];
     const bypassRoles = bypassIds
       .map(id => message.guild.roles.cache.get(id))
       .filter(Boolean);
     if (cmd === 'lock') {
-      await ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: `Locked by ${message.author.tag}: ${reason}` });
+      await ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: `Locked by ${message.author.tag}` });
       for (const role of bypassRoles) {
         await ch.permissionOverwrites.edit(role, { SendMessages: true }, { reason: 'Lock whitelist bypass' }).catch(() => {});
       }
       const bypassLine = bypassRoles.length ? `\nWhitelisted roles can still type.` : '';
-      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔒 Channel Locked').setDescription(`Everyone cannot send messages.${bypassLine}`).addFields({ name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
+      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔒 Channel Locked').setDescription(`Everyone cannot send messages.${bypassLine}`).addFields({ name: 'Moderator', value: message.author.tag, inline: true }).setTimestamp()] });
     } else {
-      await ch.permissionOverwrites.edit(everyone, { SendMessages: null }, { reason: `Unlocked by ${message.author.tag}: ${reason}` });
+      await ch.permissionOverwrites.edit(everyone, { SendMessages: null }, { reason: `Unlocked by ${message.author.tag}` });
       for (const role of bypassRoles) {
         await ch.permissionOverwrites.edit(role, { SendMessages: null }, { reason: 'Lock removed' }).catch(() => {});
       }
-      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔓 Channel Unlocked').addFields({ name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: reason }).setTimestamp()] });
+      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔓 Channel Unlocked').addFields({ name: 'Moderator', value: message.author.tag, inline: true }).setTimestamp()] });
     }
   }
 
