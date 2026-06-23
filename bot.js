@@ -916,9 +916,7 @@ client.on('messageCreate', async message => {
       list.push(role.id);
       await db.set(key, list);
       const all = list.map(id => { const r = message.guild.roles.cache.get(id); return r ? `<@&${r.id}>` : null; }).filter(Boolean).join(' ');
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Lock Whitelist').setDescription(`Added ${role}.
-
-**Current whitelist:** ${all}`)] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Lock Whitelist').setDescription(`Added ${role}.\n\n**Current whitelist:** ${all}`)] });
     }
     if (action === 'remove') {
       const role = message.mentions.roles.first();
@@ -927,14 +925,11 @@ client.on('messageCreate', async message => {
       await db.set(key, list.filter(id => id !== role.id));
       const remaining = list.filter(id => id !== role.id);
       const all = remaining.length ? remaining.map(id => { const r = message.guild.roles.cache.get(id); return r ? `<@&${r.id}>` : null; }).filter(Boolean).join(' ') : 'None';
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Lock Whitelist').setDescription(`Removed ${role}.
-
-**Current whitelist:** ${all}`)] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Lock Whitelist').setDescription(`Removed ${role}.\n\n**Current whitelist:** ${all}`)] });
     }
     if (action === 'list' || !action) {
       if (!list.length) return message.reply('❌ No roles whitelisted. Use `-lockwhitelist add @role`');
-      const all = list.map(id => { const r = message.guild.roles.cache.get(id); return r ? `• <@&${r.id}>` : null; }).filter(Boolean).join('
-');
+      const all = list.map(id => { const r = message.guild.roles.cache.get(id); return r ? `• <@&${r.id}>` : null; }).filter(Boolean).join('\n');
       return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🔒 Lock Whitelist').setDescription(all).setFooter({ text: `${list.length} role(s) — these can type in locked channels` })] });
     }
     message.reply('❌ Usage: `-lockwhitelist add/remove @role` or `-lockwhitelist list`');
