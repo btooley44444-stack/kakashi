@@ -12,6 +12,7 @@ const client  = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildInvites,   // ← required for invite tracking
     GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.GuildMember],
@@ -19,7 +20,22 @@ const client  = new Client({
 
 const PREFIX      = '-';
 const restoring   = new Set();
-const snapCooldown = new Map(); // in-memory cooldown — no DB read, no race condition
+const snapCooldown = new Map();
+
+// ─────────────────────────────────────────────
+//  INVITE CACHE  (guildId → Map(code → { uses, inviterId }))
+// ─────────────────────────────────────────────
+const inviteCache = new Map();
+
+async function cacheInvites(guild) {
+  try {
+    const invites = await guild.invites.fetch();
+    inviteCache.set(
+      guild.id,
+      new Map(invites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]))
+    );
+  } catch {}
+}
 
 // ─────────────────────────────────────────────
 //  SETTINGS CACHE
@@ -90,8 +106,6 @@ function snapCh(ch) {
 }
 
 async function saveSnapshot(guild, channels) {
-  // channels = array of channel objects to snapshot
-  // if not provided, use full guild cache
   const list = channels || [...guild.channels.cache.values()];
   await db.set(`snap.${guild.id}`,      list.map(snapCh));
   await db.set(`snap.${guild.id}.time`, Date.now());
@@ -155,7 +169,6 @@ async function autoRestore(guild) {
 
     let removed = 0, restored = 0, skipped = 0, failed = 0;
 
-    // Step 1: delete nuke channels in parallel
     const snapIds = new Set(snapshot.map(c => c.id));
     const nukeChs = [...guild.channels.cache.values()].filter(c => !snapIds.has(c.id));
     console.log(`[restore] Deleting ${nukeChs.length} nuke channels`);
@@ -163,18 +176,15 @@ async function autoRestore(guild) {
     removed = nukeChs.length;
     await new Promise(r => setTimeout(r, 2000));
 
-    // Step 2: recreate categories
     const catMap = new Map();
     const categories = snapshot.filter(c => c.type === 4);
     console.log(`[restore] Creating ${categories.length} categories`);
 
     for (const ch of categories) {
       try {
-        // Check if it already exists by name
         const existing = guild.channels.cache.find(c => c.name === ch.name && c.type === 4);
         if (existing) {
           catMap.set(ch.id, existing.id);
-          console.log(`[restore] Category exists: ${ch.name}`);
           skipped++;
           continue;
         }
@@ -182,46 +192,19 @@ async function autoRestore(guild) {
           name: ch.name, type: ch.type, position: ch.position,
           permissionOverwrites: buildPerms(ch.permissionOverwrites),
         });
-        if (newCh) {
-          catMap.set(ch.id, newCh.id);
-          console.log(`[restore] Created category: ${ch.name} (${ch.id} → ${newCh.id})`);
-          restored++;
-        } else {
-          console.log(`[restore] FAILED category: ${ch.name}`);
-          failed++;
-        }
-      } catch (e) {
-        console.error(`[restore] Category error ${ch.name}:`, e.message);
-        failed++;
-      }
+        if (newCh) { catMap.set(ch.id, newCh.id); restored++; }
+        else failed++;
+      } catch { failed++; }
       await new Promise(r => setTimeout(r, 500));
     }
 
-    // Step 3: recreate all other channels
     const channels = snapshot.filter(c => c.type !== 4);
-    console.log(`[restore] Creating ${channels.length} channels, catMap has ${catMap.size} entries`);
-
     for (const ch of channels) {
       try {
-        if (!CREATABLE.has(ch.type)) {
-          console.log(`[restore] Skip unsupported type ${ch.type}: ${ch.name}`);
-          skipped++;
-          continue;
-        }
-
-        // Check by name+type to avoid duplicates
+        if (!CREATABLE.has(ch.type)) { skipped++; continue; }
         const existing = guild.channels.cache.find(c => c.name === ch.name && c.type === ch.type);
-        if (existing) {
-          console.log(`[restore] Already exists: ${ch.name}`);
-          skipped++;
-          continue;
-        }
-
+        if (existing) { skipped++; continue; }
         const parentId = ch.parentId ? catMap.get(ch.parentId) : null;
-        if (ch.parentId && !parentId) {
-          console.log(`[restore] Warning: no catMap entry for parentId ${ch.parentId} (channel: ${ch.name})`);
-        }
-
         const opts = {
           name: ch.name, type: ch.type, position: ch.position,
           permissionOverwrites: buildPerms(ch.permissionOverwrites),
@@ -232,19 +215,9 @@ async function autoRestore(guild) {
         if (ch.rateLimitPerUser) opts.rateLimitPerUser = ch.rateLimitPerUser;
         if (ch.bitrate)          opts.bitrate          = ch.bitrate;
         if (ch.userLimit)        opts.userLimit        = ch.userLimit;
-
         const newCh = await makeChannel(guild, opts);
-        if (newCh) {
-          console.log(`[restore] Created: ${ch.name} (parent: ${parentId || 'none'})`);
-          restored++;
-        } else {
-          console.log(`[restore] FAILED: ${ch.name}`);
-          failed++;
-        }
-      } catch (e) {
-        console.error(`[restore] Channel error ${ch.name}:`, e.message);
-        failed++;
-      }
+        if (newCh) restored++; else failed++;
+      } catch { failed++; }
       await new Promise(r => setTimeout(r, 500));
     }
 
@@ -269,23 +242,20 @@ client.once('ready', async () => {
     status: 'online',
   });
 
-  // Initial snapshots for all guilds with antinuke enabled
   for (const guild of client.guilds.cache.values()) {
     try {
       const s = await getSettings(guild.id);
       if (s.enabled) await saveSnapshot(guild);
     } catch {}
+    await cacheInvites(guild); // cache invites for all guilds on startup
   }
 
-  // Refresh every 30 seconds — ensures snapshot is always recent
   setInterval(async () => {
     for (const guild of client.guilds.cache.values()) {
       try {
         const s = await getSettings(guild.id);
         if (s.enabled && !restoring.has(guild.id)) {
           await saveSnapshot(guild);
-          // Also refresh the in-memory cooldown so the next deletion
-          // (if it happens right after the periodic save) doesn't overwrite
           snapCooldown.set(guild.id, Date.now());
         }
       } catch {}
@@ -293,24 +263,100 @@ client.once('ready', async () => {
   }, 30 * 1000);
 });
 
+// Cache invites when bot joins a new guild
+client.on('guildCreate', guild => cacheInvites(guild));
+
+// Keep invite cache fresh when invites are created/deleted
+client.on('inviteCreate', invite => {
+  if (!invite.guild) return;
+  const cache = inviteCache.get(invite.guild.id) || new Map();
+  cache.set(invite.code, { uses: invite.uses ?? 0, inviterId: invite.inviter?.id ?? null });
+  inviteCache.set(invite.guild.id, cache);
+});
+
+client.on('inviteDelete', invite => {
+  if (!invite.guild) return;
+  inviteCache.get(invite.guild.id)?.delete(invite.code);
+});
+
 // ─────────────────────────────────────────────
-//  WELCOME + AUTOROLE
+//  WELCOME + AUTOROLE  (with invite tracking)
 // ─────────────────────────────────────────────
 client.on('guildMemberAdd', async member => {
   const { guild, user } = member;
+
+  // ── Detect which invite was used ──────────────────────────────
+  let inviter      = null;
+  let inviterCount = 0;
+
+  try {
+    const oldCache  = inviteCache.get(guild.id) || new Map();
+    const newInvites = await guild.invites.fetch();
+
+    for (const [code, inv] of newInvites) {
+      const old = oldCache.get(code);
+      // This invite's use count went up — it's the one that was used
+      if (old !== undefined && inv.uses > old.uses) {
+        const inviterId = inv.inviter?.id ?? old.inviterId;
+        if (inviterId) {
+          inviter = await client.users.fetch(inviterId).catch(() => null);
+          // Persist the invite count so it survives restarts
+          const key     = `invites.${guild.id}.${inviterId}`;
+          const current = (await db.get(key)) ?? 0;
+          await db.set(key, current + 1);
+          inviterCount = current + 1;
+        }
+        break;
+      }
+    }
+
+    // Update in-memory cache with fresh data
+    inviteCache.set(
+      guild.id,
+      new Map(newInvites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]))
+    );
+  } catch {}
+
+  // ── Welcome message ───────────────────────────────────────────
   const chId = await db.get(`welcome.${guild.id}.channel`);
   if (chId) {
-    const ch = guild.channels.cache.get(chId);
-    let msg  = await db.get(`welcome.${guild.id}.message`);
+    // Try cache first; fall back to API fetch (this was the main bug)
+    const ch = guild.channels.cache.get(chId)
+      ?? await guild.channels.fetch(chId).catch(() => null);
+
+    let msg = await db.get(`welcome.${guild.id}.message`);
     if (ch) {
       if (msg) {
-        msg = msg.replace(/{user}/g, `<@${user.id}>`).replace(/{username}/g, user.username).replace(/{server}/g, guild.name).replace(/{memberCount}/g, guild.memberCount);
+        // Replace all supported placeholders
+        msg = msg
+          .replace(/{user}/g,          `<@${user.id}>`)
+          .replace(/{username}/g,       user.username)
+          .replace(/{server}/g,         guild.name)
+          .replace(/{memberCount}/g,    guild.memberCount)
+          .replace(/{inviter}/g,        inviter ? `<@${inviter.id}>` : 'Unknown')
+          .replace(/{inviterTag}/g,     inviter?.tag ?? 'Unknown')
+          .replace(/{inviterCount}/g,   String(inviterCount));
         ch.send(msg).catch(() => {});
       } else {
-        ch.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${guild.name}!`).setDescription(`Hey <@${user.id}>, you are member **#${guild.memberCount}**!`).setThumbnail(user.displayAvatarURL()).setTimestamp()] }).catch(() => {});
+        // Default embed — shows inviter when known
+        const desc = inviter
+          ? `Hey <@${user.id}>, you are member **#${guild.memberCount}**!\n\nInvited by **${inviter.tag}** · **${inviterCount}** invite${inviterCount !== 1 ? 's' : ''}`
+          : `Hey <@${user.id}>, you are member **#${guild.memberCount}**!`;
+        ch.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x5865f2)
+              .setTitle(`Welcome to ${guild.name}!`)
+              .setDescription(desc)
+              .setThumbnail(user.displayAvatarURL())
+              .setTimestamp(),
+          ],
+        }).catch(() => {});
       }
     }
   }
+
+  // ── Autorole ──────────────────────────────────────────────────
   for (const rid of (await db.get(`autorole.${guild.id}.roles`)) || []) {
     const r = guild.roles.cache.get(rid);
     if (r && guild.members.me.roles.highest.position > r.position) member.roles.add(r).catch(() => {});
@@ -324,31 +370,22 @@ client.on('channelDelete', async channel => {
   if (!channel.guild || restoring.has(channel.guild.id)) return;
   const { guild } = channel;
 
-  // ── SYNCHRONOUS capture — must happen before any await ──────────
-  // If we await first, the event loop processes more deletions and
-  // removes channels from guild.channels.cache before we can save them.
   const capturedChannels = [...guild.channels.cache.values()];
   if (!capturedChannels.find(c => c.id === channel.id)) {
     capturedChannels.push(channel);
   }
 
-  // Start audit log fetch immediately (parallel, no await yet)
   prefetch(guild, AuditLogEvent.ChannelDelete);
 
-  // ── IN-MEMORY cooldown — no DB read = no race condition ─────────
-  // snapCooldown is a plain Map, checked synchronously.
-  // Set it BEFORE the async DB write so other events see it immediately.
   const now = Date.now();
   const lastSnap = snapCooldown.get(guild.id) || 0;
   if (now - lastSnap > 5000) {
-    snapCooldown.set(guild.id, now); // synchronous — other events see this instantly
-    // Fire-and-forget DB write — completes before autoRestore needs it
+    snapCooldown.set(guild.id, now);
     db.set(`snap.${guild.id}`, capturedChannels.map(snapCh)).catch(() => {});
     db.set(`snap.${guild.id}.time`, now).catch(() => {});
     console.log(`[snap] ${guild.name}: captured ${capturedChannels.length} channels on deletion`);
   }
 
-  // Fast in-memory threshold check
   if (!crossed(counters.ch, guild.id)) return;
 
   const s = await getSettings(guild.id);
@@ -415,10 +452,68 @@ client.on('messageCreate', async message => {
       embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Commands').addFields(
         { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-timeout @user <60s|5m|10m|1h|1d|1w> [reason]`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`' },
         { name: '🎭 Roles',      value: '`-role add @user <name>`\n`-role remove @user <name>`' },
-        { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`' },
+        { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset someone\'s count (admin)' },
+        { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`\n\nPlaceholders: `{user}` `{username}` `{server}` `{memberCount}` `{inviter}` `{inviterTag}` `{inviterCount}`' },
         { name: '⚙️ Config',     value: '`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
         { name: '🛡️ Antinuke (owner only)', value: '`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke snapshot` — manually save snapshot\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
-      ).setFooter({ text: `Prefix: ${PREFIX}  •  Snapshot auto-saves every 30s and on every channel deletion` })],
+      ).setFooter({ text: `Prefix: ${PREFIX}  •  Snapshot auto-saves every 30s` })],
+    });
+  }
+
+  // ── -invites ───────────────────────────────────────────────────
+  if (cmd === 'invites') {
+    const isReset  = args[0]?.toLowerCase() === 'reset';
+    const target   = message.mentions.users.first() ?? message.author;
+
+    if (isReset) {
+      if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+        return message.reply('❌ You need **Manage Server** permission.');
+      const resetTarget = message.mentions.users.first();
+      if (!resetTarget) return message.reply('❌ Usage: `-invites reset @user`');
+      await db.set(`invites.${message.guild.id}.${resetTarget.id}`, 0);
+      return message.reply(`✅ Reset invite count for **${resetTarget.tag}**.`);
+    }
+
+    const count = (await db.get(`invites.${message.guild.id}.${target.id}`)) ?? 0;
+    return message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle('📨 Invite Count')
+          .setDescription(`**${target.tag}** has **${count}** invite${count !== 1 ? 's' : ''} in **${message.guild.name}**.`)
+          .setThumbnail(target.displayAvatarURL())
+          .setTimestamp(),
+      ],
+    });
+  }
+
+  // ── -inviteleaderboard ─────────────────────────────────────────
+  if (cmd === 'inviteleaderboard' || cmd === 'invlb') {
+    // Fetch all members and their stored invite counts
+    const members = await message.guild.members.fetch().catch(() => null);
+    if (!members) return message.reply('❌ Could not fetch members.');
+
+    const entries = [];
+    for (const [uid] of members) {
+      const count = (await db.get(`invites.${message.guild.id}.${uid}`)) ?? 0;
+      if (count > 0) entries.push({ uid, count });
+    }
+
+    entries.sort((a, b) => b.count - a.count);
+    const top = entries.slice(0, 10);
+
+    if (!top.length) return message.reply('❌ No invite data yet.');
+
+    const lines = top.map((e, i) => `**${i + 1}.** <@${e.uid}> — **${e.count}** invite${e.count !== 1 ? 's' : ''}`);
+    return message.reply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle('📨 Invite Leaderboard')
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: `${message.guild.name} • Top ${top.length}` })
+          .setTimestamp(),
+      ],
     });
   }
 
@@ -565,7 +660,7 @@ client.on('messageCreate', async message => {
       const text = args.slice(1).join(' ');
       if (!text) return message.reply('❌ Usage: `-setwelcome message Hello {user}!`');
       await db.set(`welcome.${gid}.message`, text);
-      return message.reply('✅ Set! Placeholders: `{user}` `{username}` `{server}` `{memberCount}`');
+      return message.reply('✅ Set! Placeholders: `{user}` `{username}` `{server}` `{memberCount}` `{inviter}` `{inviterTag}` `{inviterCount}`');
     }
     if (sub === 'disable') {
       await db.delete(`welcome.${gid}.channel`); await db.delete(`welcome.${gid}.message`);
@@ -574,14 +669,30 @@ client.on('messageCreate', async message => {
     if (sub === 'test') {
       const cid = await db.get(`welcome.${gid}.channel`);
       if (!cid) return message.reply('❌ Set a channel first.');
-      const chan = message.guild.channels.cache.get(cid);
+      const chan = guild.channels.cache.get(cid) ?? await message.guild.channels.fetch(cid).catch(() => null);
       if (!chan) return message.reply('❌ Channel no longer exists.');
       let msg = await db.get(`welcome.${gid}.message`);
       if (msg) {
-        msg = msg.replace(/{user}/g, `<@${message.author.id}>`).replace(/{username}/g, message.author.username).replace(/{server}/g, message.guild.name).replace(/{memberCount}/g, message.guild.memberCount);
+        msg = msg
+          .replace(/{user}/g,          `<@${message.author.id}>`)
+          .replace(/{username}/g,       message.author.username)
+          .replace(/{server}/g,         message.guild.name)
+          .replace(/{memberCount}/g,    message.guild.memberCount)
+          .replace(/{inviter}/g,        `<@${message.author.id}>`)
+          .replace(/{inviterTag}/g,     message.author.tag)
+          .replace(/{inviterCount}/g,   '1');
         await chan.send(msg);
       } else {
-        await chan.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${message.guild.name}!`).setDescription(`Hey <@${message.author.id}>, member **#${message.guild.memberCount}**!`).setThumbnail(message.author.displayAvatarURL()).setTimestamp()] });
+        await chan.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x5865f2)
+              .setTitle(`Welcome to ${message.guild.name}!`)
+              .setDescription(`Hey <@${message.author.id}>, member **#${message.guild.memberCount}**!\n\nInvited by **${message.author.tag}** · **1** invite (test)`)
+              .setThumbnail(message.author.displayAvatarURL())
+              .setTimestamp(),
+          ],
+        });
       }
       return message.reply(`✅ Test sent to ${chan}.`);
     }
