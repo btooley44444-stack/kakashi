@@ -867,59 +867,77 @@ client.on('messageCreate', async message => {
       return message.reply('❌ You need **Manage Channels** permission.');
     const ch       = message.channel;
     const everyone = message.guild.roles.everyone;
-    const bypassIds = (await db.get(`lockwhitelist.${message.guild.id}`)) || [];
-    const bypassRoles = bypassIds
-      .map(id => message.guild.roles.cache.get(id))
-      .filter(Boolean);
+    const bypassIds   = (await db.get(`lockwhitelist.${message.guild.id}`)) ?? [];
+    const bypassRoles = bypassIds.map(id => message.guild.roles.cache.get(id)).filter(Boolean);
     if (cmd === 'lock') {
       await ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: `Locked by ${message.author.tag}` });
       for (const role of bypassRoles) {
         await ch.permissionOverwrites.edit(role, { SendMessages: true }, { reason: 'Lock whitelist bypass' }).catch(() => {});
       }
-      const bypassLine = bypassRoles.length ? `\nWhitelisted roles can still type.` : '';
-      message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔒 Channel Locked').setDescription(`Everyone cannot send messages.${bypassLine}`).addFields({ name: 'Moderator', value: message.author.tag, inline: true }).setTimestamp()] });
+      const roleList = bypassRoles.length ? bypassRoles.map(r => `<@&${r.id}>`).join(' ') : 'None set — use `-lockwhitelist add @role`';
+      ch.send({
+        embeds: [new EmbedBuilder()
+          .setColor(0xff4444)
+          .setTitle('🔒 Channel Locked')
+          .setDescription(`This channel has been locked.\n\n**Roles that can still type:** ${roleList}`)
+          .setFooter({ text: `Locked by ${message.author.tag}` })
+          .setTimestamp()
+        ]
+      });
     } else {
       await ch.permissionOverwrites.edit(everyone, { SendMessages: null }, { reason: `Unlocked by ${message.author.tag}` });
       for (const role of bypassRoles) {
         await ch.permissionOverwrites.edit(role, { SendMessages: null }, { reason: 'Lock removed' }).catch(() => {});
       }
-      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔓 Channel Unlocked').addFields({ name: 'Moderator', value: message.author.tag, inline: true }).setTimestamp()] });
+      ch.send({
+        embeds: [new EmbedBuilder()
+          .setColor(0x00cc44)
+          .setTitle('🔓 Channel Unlocked')
+          .setDescription('Everyone can type here again.')
+          .setFooter({ text: `Unlocked by ${message.author.tag}` })
+          .setTimestamp()
+        ]
+      });
     }
   }
 
-  // ── -whitelist ─────────────────────────────────────────────────
-  else if (cmd === 'whitelist') {
-    const sub = args[0]?.toLowerCase();
-    if (sub !== 'lock') return message.reply('❌ Usage: `-whitelist lock add/remove/list @role`');
+  // ── -lockwhitelist ─────────────────────────────────────────────
+  else if (cmd === 'lockwhitelist') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return message.reply('❌ You need **Manage Server** permission.');
-    const action = args[1]?.toLowerCase();
-    const role   = message.mentions.roles.first();
+    const action = args[0]?.toLowerCase();
     const key    = `lockwhitelist.${message.guild.id}`;
-    const list   = (await db.get(key)) || [];
+    const list   = (await db.get(key)) ?? [];
 
     if (action === 'add') {
-      if (!role) return message.reply('❌ Usage: `-whitelist lock add @role`');
-      if (list.includes(role.id)) return message.reply(`❌ ${role} is already on the lock whitelist.`);
+      const role = message.mentions.roles.first();
+      if (!role) return message.reply('❌ Usage: `-lockwhitelist add @role`');
+      if (list.includes(role.id)) return message.reply(`❌ ${role} is already whitelisted.`);
       list.push(role.id);
       await db.set(key, list);
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Lock Whitelist Updated').setDescription(`${role} will now be able to type in locked channels.`)] });
+      const all = list.map(id => { const r = message.guild.roles.cache.get(id); return r ? `<@&${r.id}>` : null; }).filter(Boolean).join(' ');
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Lock Whitelist').setDescription(`Added ${role}.
+
+**Current whitelist:** ${all}`)] });
     }
     if (action === 'remove') {
-      if (!role) return message.reply('❌ Usage: `-whitelist lock remove @role`');
-      if (!list.includes(role.id)) return message.reply(`❌ ${role} is not on the lock whitelist.`);
+      const role = message.mentions.roles.first();
+      if (!role) return message.reply('❌ Usage: `-lockwhitelist remove @role`');
+      if (!list.includes(role.id)) return message.reply(`❌ ${role} is not whitelisted.`);
       await db.set(key, list.filter(id => id !== role.id));
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Lock Whitelist Updated').setDescription(`${role} will now be affected by locks.`)] });
+      const remaining = list.filter(id => id !== role.id);
+      const all = remaining.length ? remaining.map(id => { const r = message.guild.roles.cache.get(id); return r ? `<@&${r.id}>` : null; }).filter(Boolean).join(' ') : 'None';
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Lock Whitelist').setDescription(`Removed ${role}.
+
+**Current whitelist:** ${all}`)] });
     }
-    if (action === 'list') {
-      if (!list.length) return message.reply('❌ No roles on the lock whitelist.');
-      const lines = list.map(id => {
-        const r = message.guild.roles.cache.get(id);
-        return r ? `• ${r}` : `• Unknown role (${id})`;
-      });
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🔒 Lock Whitelist').setDescription(lines.join('\n')).setFooter({ text: `${list.length} role(s)` })] });
+    if (action === 'list' || !action) {
+      if (!list.length) return message.reply('❌ No roles whitelisted. Use `-lockwhitelist add @role`');
+      const all = list.map(id => { const r = message.guild.roles.cache.get(id); return r ? `• <@&${r.id}>` : null; }).filter(Boolean).join('
+');
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🔒 Lock Whitelist').setDescription(all).setFooter({ text: `${list.length} role(s) — these can type in locked channels` })] });
     }
-    message.reply('❌ Usage: `-whitelist lock add/remove/list @role`');
+    message.reply('❌ Usage: `-lockwhitelist add/remove @role` or `-lockwhitelist list`');
   }
 
   // ── -role ──────────────────────────────────────────────────────
