@@ -30,10 +30,13 @@ const inviteCache = new Map();
 async function cacheInvites(guild) {
   try {
     const invites = await guild.invites.fetch();
-    inviteCache.set(
-      guild.id,
-      new Map(invites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]))
-    );
+    const cache = new Map(invites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]));
+    // Also track vanity URL uses if the server has one
+    try {
+      const vanity = await guild.fetchVanityData();
+      if (vanity?.code) cache.set(`vanity:${vanity.code}`, { uses: vanity.uses, inviterId: null });
+    } catch {}
+    inviteCache.set(guild.id, cache);
   } catch {}
 }
 
@@ -290,32 +293,56 @@ client.on('guildMemberAdd', async member => {
   let inviterCount = 0;
 
   try {
-    const oldCache  = inviteCache.get(guild.id) || new Map();
+    const oldCache   = inviteCache.get(guild.id) || new Map();
     const newInvites = await guild.invites.fetch();
 
-    for (const [code, inv] of newInvites) {
+    // Build the updated cache immediately so we can compare
+    const newCache = new Map(newInvites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]));
+
+    // Also fetch vanity URL data and add to new cache
+    try {
+      const vanity = await guild.fetchVanityData();
+      if (vanity?.code) newCache.set(`vanity:${vanity.code}`, { uses: vanity.uses, inviterId: null });
+    } catch {}
+
+    // Method 1: regular invite whose use count went up
+    for (const [code, inv] of newCache) {
       const old = oldCache.get(code);
-      // This invite's use count went up — it's the one that was used
       if (old !== undefined && inv.uses > old.uses) {
-        const inviterId = inv.inviter?.id ?? old.inviterId;
+        const inviterId = inv.inviterId;
         if (inviterId) {
           inviter = await client.users.fetch(inviterId).catch(() => null);
-          // Persist the invite count so it survives restarts
           const key     = `invites.${guild.id}.${inviterId}`;
           const current = (await db.get(key)) ?? 0;
           await db.set(key, current + 1);
           inviterCount = current + 1;
+        } else if (code.startsWith('vanity:')) {
+          inviter = null; // vanity invite — no specific inviter
         }
         break;
       }
     }
 
+    // Method 2: single-use invite that got deleted after use
+    // These disappear from the new fetch, so we check what's missing
+    if (!inviter) {
+      for (const [code, old] of oldCache) {
+        if (!newCache.has(code) && !code.startsWith('vanity:') && old.inviterId) {
+          inviter = await client.users.fetch(old.inviterId).catch(() => null);
+          const key     = `invites.${guild.id}.${old.inviterId}`;
+          const current = (await db.get(key)) ?? 0;
+          await db.set(key, current + 1);
+          inviterCount = current + 1;
+          break;
+        }
+      }
+    }
+
     // Update in-memory cache with fresh data
-    inviteCache.set(
-      guild.id,
-      new Map(newInvites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]))
-    );
-  } catch {}
+    inviteCache.set(guild.id, newCache);
+  } catch (e) {
+    console.error('[inviteTracker]', e.message);
+  }
 
   // ── Welcome message ───────────────────────────────────────────
   const chId = await db.get(`welcome.${guild.id}.channel`);
