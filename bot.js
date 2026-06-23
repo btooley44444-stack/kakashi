@@ -14,9 +14,78 @@ const client  = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildInvites,   // ← required for invite tracking
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
   ],
-  partials: [Partials.GuildMember],
+  partials: [Partials.GuildMember, Partials.Message, Partials.Reaction],
 });
+
+
+// ─────────────────────────────────────────────
+//  GIVEAWAY HELPERS
+// ─────────────────────────────────────────────
+const giveawayTimers = new Map(); // messageId -> timeout handle
+
+function parseDuration(str) {
+  const units = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
+  const match  = str.match(/^(\d+)(s|m|h|d)$/i);
+  if (!match) return null;
+  return parseInt(match[1]) * units[match[2].toLowerCase()];
+}
+
+function formatDuration(ms) {
+  if (ms >= 86400000) return `${Math.round(ms / 86400000)}d`;
+  if (ms >= 3600000)  return `${Math.round(ms / 3600000)}h`;
+  if (ms >= 60000)    return `${Math.round(ms / 60000)}m`;
+  return `${Math.round(ms / 1000)}s`;
+}
+
+async function endGiveaway(guildId, messageId, reroll = false) {
+  const data = await db.get(`giveaways.${guildId}.${messageId}`);
+  if (!data) return;
+  if (!reroll && !data.active) return;
+
+  const guild   = client.guilds.cache.get(guildId);
+  const channel = guild?.channels.cache.get(data.channelId)
+    ?? await guild?.channels.fetch(data.channelId).catch(() => null);
+  const message = await channel?.messages.fetch(messageId).catch(() => null);
+
+  // Fetch all 🎉 reactors, filter bots
+  const reaction = message?.reactions.cache.get('🎉');
+  let users = reaction ? (await reaction.users.fetch().catch(() => null)) : null;
+  users = users?.filter(u => !u.bot) ?? new (require('discord.js').Collection)();
+
+  if (!reroll) {
+    await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false });
+    giveawayTimers.delete(messageId);
+  }
+
+  if (users.size === 0) {
+    await message?.edit({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🎉 GIVEAWAY ENDED').setDescription(`**${data.prize}**\n\nNo valid entries — no winner.`).setFooter({ text: `${data.winnerCount} winner(s) • Ended` }).setTimestamp()] }).catch(() => {});
+    await channel?.send({ embeds: [new EmbedBuilder().setColor(0xff4444).setDescription(`🎉 The giveaway for **${data.prize}** ended with no valid entries.`)] }).catch(() => {});
+    return;
+  }
+
+  // Pick winners randomly without repeats
+  const pool = [...users.values()];
+  const count = Math.min(data.winnerCount, pool.length);
+  const winners = [];
+  while (winners.length < count) {
+    const idx = Math.floor(Math.random() * pool.length);
+    winners.push(pool.splice(idx, 1)[0]);
+  }
+
+  const mentions = winners.map(w => `<@${w.id}>`).join(', ');
+  await message?.edit({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 GIVEAWAY ENDED').setDescription(`**${data.prize}**\n\n🏆 Winner${count > 1 ? 's' : ''}: ${mentions}`).setFooter({ text: `${count} winner(s) • Ended` }).setTimestamp()] }).catch(() => {});
+  await channel?.send({ content: mentions, embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🎉 Congrats ${mentions}! You won **${data.prize}**!\n\n*Hosted by <@${data.hostId}>*`)] }).catch(() => {});
+
+  if (!reroll) await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false, lastWinners: winners.map(w => w.id) });
+}
+
+function scheduleGiveaway(guildId, messageId, endsAt) {
+  const delay = Math.max(endsAt - Date.now(), 0);
+  const timer = setTimeout(() => endGiveaway(guildId, messageId), delay);
+  giveawayTimers.set(messageId, timer);
+}
 
 const PREFIX      = '-';
 const restoring   = new Set();
@@ -253,6 +322,23 @@ client.once('ready', async () => {
     await cacheInvites(guild); // cache invites for all guilds on startup
   }
 
+  // Reschedule any giveaways that were active when bot last restarted
+  try {
+    const allKeys = await db.list('giveaways.');
+    for (const key of (allKeys?.keys ?? [])) {
+      const data = await db.get(key);
+      if (data?.active) {
+        const parts = key.split('.');
+        const [guildId, messageId] = [parts[1], parts[2]];
+        if (Date.now() >= data.endsAt) {
+          endGiveaway(guildId, messageId);
+        } else {
+          scheduleGiveaway(guildId, messageId, data.endsAt);
+        }
+      }
+    }
+  } catch {}
+
   setInterval(async () => {
     for (const guild of client.guilds.cache.values()) {
       try {
@@ -481,6 +567,7 @@ client.on('messageCreate', async message => {
         { name: '🎭 Roles',      value: '`-role add @user <name>`\n`-role remove @user <name>`' },
         { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset someone\'s count (admin)' },
         { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`\n\nPlaceholders: `{user}` `{username}` `{server}` `{memberCount}` `{inviter}` `{inviterTag}` `{inviterCount}`' },
+        { name: '🎉 Giveaways',   value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nDurations: `30s` `10m` `1h` `12h` `1d` `7d`' },
         { name: '⚙️ Config',     value: '`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
         { name: '🛡️ Antinuke (owner only)', value: '`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke snapshot` — manually save snapshot\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
       ).setFooter({ text: `Prefix: ${PREFIX}  •  Snapshot auto-saves every 30s` })],
@@ -784,6 +871,88 @@ client.on('messageCreate', async message => {
     }
     message.reply('❌ Usage: `add @role` | `remove @role` | `list`');
   }
+
+  // ── -gcreate ───────────────────────────────────────────────────
+  else if (cmd === 'gcreate' || cmd === 'gstart') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    // Usage: -gcreate <duration> <winners> <prize>
+    const duration = parseDuration(args[0]);
+    if (!duration) return message.reply('❌ Usage: `-gcreate <duration> <winners> <prize>`\nDurations: `30s` `10m` `1h` `12h` `1d` `7d`');
+    const winnerCount = parseInt(args[1]);
+    if (isNaN(winnerCount) || winnerCount < 1 || winnerCount > 20)
+      return message.reply('❌ Winners must be a number between 1 and 20.');
+    const prize = args.slice(2).join(' ');
+    if (!prize) return message.reply('❌ Please provide a prize name.');
+
+    const endsAt = Date.now() + duration;
+    const embed  = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('🎉 GIVEAWAY')
+      .setDescription(`**${prize}**\n\nReact with 🎉 to enter!\n\n⏰ Ends: <t:${Math.floor(endsAt / 1000)}:R>`)
+      .addFields(
+        { name: 'Duration',  value: formatDuration(duration), inline: true },
+        { name: 'Winners',   value: String(winnerCount),      inline: true },
+        { name: 'Hosted by', value: message.author.tag,       inline: true },
+      )
+      .setFooter({ text: `${winnerCount} winner(s) • Ends` })
+      .setTimestamp(endsAt);
+
+    const gMsg = await message.channel.send({ embeds: [embed] });
+    await gMsg.react('🎉');
+
+    await db.set(`giveaways.${message.guild.id}.${gMsg.id}`, {
+      channelId: message.channel.id,
+      prize, winnerCount, endsAt,
+      hostId: message.author.id,
+      active: true,
+    });
+    scheduleGiveaway(message.guild.id, gMsg.id, endsAt);
+    message.reply(`✅ Giveaway started! [Jump to it](${gMsg.url})`);
+  }
+
+  // ── -gend ──────────────────────────────────────────────────────
+  else if (cmd === 'gend') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    const mid = args[0];
+    if (!mid) return message.reply('❌ Usage: `-gend <messageId>`');
+    const data = await db.get(`giveaways.${message.guild.id}.${mid}`);
+    if (!data) return message.reply('❌ No giveaway found with that message ID.');
+    if (!data.active) return message.reply('❌ That giveaway has already ended.');
+    clearTimeout(giveawayTimers.get(mid));
+    await endGiveaway(message.guild.id, mid);
+    message.reply('✅ Giveaway ended.');
+  }
+
+  // ── -greroll ───────────────────────────────────────────────────
+  else if (cmd === 'greroll') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    const mid = args[0];
+    if (!mid) return message.reply('❌ Usage: `-greroll <messageId>`');
+    const data = await db.get(`giveaways.${message.guild.id}.${mid}`);
+    if (!data) return message.reply('❌ No giveaway found with that message ID.');
+    if (data.active) return message.reply('❌ That giveaway is still running. Use `-gend` first.');
+    await endGiveaway(message.guild.id, mid, true);
+    message.reply('✅ Rerolled!');
+  }
+
+  // ── -glist ─────────────────────────────────────────────────────
+  else if (cmd === 'glist') {
+    const allKeys = await db.list(`giveaways.${message.guild.id}.`);
+    const active  = [];
+    for (const key of (allKeys?.keys ?? [])) {
+      const data = await db.get(key);
+      if (data?.active) {
+        const mid = key.split('.')[2];
+        active.push(`• **${data.prize}** — ${data.winnerCount} winner(s) — ends <t:${Math.floor(data.endsAt / 1000)}:R> — [ID: \`${mid}\`]`);
+      }
+    }
+    if (!active.length) return message.reply('❌ No active giveaways.');
+    message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 Active Giveaways').setDescription(active.join('\n')).setTimestamp()] });
+  }
+
 
   // ── -antinuke ──────────────────────────────────────────────────
   else if (cmd === 'antinuke' || cmd === 'an') {
