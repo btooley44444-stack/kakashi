@@ -102,13 +102,16 @@ async function cacheInvites(guild) {
   try {
     const invites = await guild.invites.fetch();
     const cache = new Map(invites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]));
-    // Also track vanity URL uses if the server has one
     try {
       const vanity = await guild.fetchVanityData();
       if (vanity?.code) cache.set(`vanity:${vanity.code}`, { uses: vanity.uses, inviterId: null });
     } catch {}
     inviteCache.set(guild.id, cache);
-  } catch {}
+    console.log(`[invites] Cached ${cache.size} invite(s) for ${guild.name}`);
+  } catch (e) {
+    console.error(`[invites] Failed to cache invites for ${guild.name}:`, e.message);
+    console.error(`[invites] Make sure the bot has Manage Server permission and GuildInvites intent is ON in the Developer Portal`);
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -381,94 +384,116 @@ client.on('guildMemberAdd', async member => {
   let inviterCount = 0;
 
   try {
-    const oldCache   = inviteCache.get(guild.id) || new Map();
+    const oldCache = inviteCache.get(guild.id);
+    if (!oldCache) {
+      console.warn(`[invites] No cached invites for ${guild.name} — was cacheInvites called? Check Manage Server permission + GuildInvites intent in Developer Portal`);
+    }
+    const cachedBefore = oldCache || new Map();
+
     const newInvites = await guild.invites.fetch();
+    const newCache   = new Map(newInvites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]));
 
-    // Build the updated cache immediately so we can compare
-    const newCache = new Map(newInvites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]));
-
-    // Also fetch vanity URL data and add to new cache
     try {
       const vanity = await guild.fetchVanityData();
       if (vanity?.code) newCache.set(`vanity:${vanity.code}`, { uses: vanity.uses, inviterId: null });
     } catch {}
 
-    // Method 1: regular invite whose use count went up
+    console.log(`[invites] ${user.tag} joined ${guild.name} — comparing ${cachedBefore.size} cached vs ${newCache.size} current invite(s)`);
+
+    // Method 1: invite whose use count went up
     for (const [code, inv] of newCache) {
-      const old = oldCache.get(code);
+      const old = cachedBefore.get(code);
       if (old !== undefined && inv.uses > old.uses) {
-        const inviterId = inv.inviterId;
-        if (inviterId) {
-          inviter = await client.users.fetch(inviterId).catch(() => null);
-          const key     = `invites.${guild.id}.${inviterId}`;
-          const current = (await db.get(key)) ?? 0;
-          await db.set(key, current + 1);
-          inviterCount = current + 1;
-        } else if (code.startsWith('vanity:')) {
-          inviter = null; // vanity invite — no specific inviter
+        if (code.startsWith('vanity:')) {
+          console.log(`[invites] ${user.tag} joined via vanity URL`);
+        } else {
+          const inviterId = inv.inviterId;
+          if (inviterId) {
+            inviter = await client.users.fetch(inviterId).catch(() => null);
+            const key     = `invites.${guild.id}.${inviterId}`;
+            const current = (await db.get(key)) ?? 0;
+            await db.set(key, current + 1);
+            inviterCount = current + 1;
+            console.log(`[invites] ${user.tag} was invited by ${inviter?.tag ?? inviterId} (${inviterCount} total invites)`);
+          }
         }
         break;
       }
     }
 
     // Method 2: single-use invite that got deleted after use
-    // These disappear from the new fetch, so we check what's missing
     if (!inviter) {
-      for (const [code, old] of oldCache) {
+      for (const [code, old] of cachedBefore) {
         if (!newCache.has(code) && !code.startsWith('vanity:') && old.inviterId) {
           inviter = await client.users.fetch(old.inviterId).catch(() => null);
           const key     = `invites.${guild.id}.${old.inviterId}`;
           const current = (await db.get(key)) ?? 0;
           await db.set(key, current + 1);
           inviterCount = current + 1;
+          console.log(`[invites] ${user.tag} used a single-use invite from ${inviter?.tag ?? old.inviterId}`);
           break;
         }
       }
     }
 
-    // Update in-memory cache with fresh data
+    if (!inviter) console.warn(`[invites] Could not determine who invited ${user.tag}`);
+
+    // Update cache
     inviteCache.set(guild.id, newCache);
   } catch (e) {
-    console.error('[inviteTracker]', e.message);
+    console.error(`[invites] Error tracking invite for ${user.tag}:`, e.message);
   }
 
   // ── Welcome message ───────────────────────────────────────────
-  const chId = await db.get(`welcome.${guild.id}.channel`);
-  if (chId) {
-    // Try cache first; fall back to API fetch (this was the main bug)
-    const ch = guild.channels.cache.get(chId)
-      ?? await guild.channels.fetch(chId).catch(() => null);
+  try {
+    const chId = await db.get(`welcome.${guild.id}.channel`);
+    if (!chId) {
+      console.log(`[welcome] ${guild.name}: no channel set, skipping`);
+    } else {
+      const ch = guild.channels.cache.get(chId)
+        ?? await guild.channels.fetch(chId).catch(() => null);
 
-    let msg = await db.get(`welcome.${guild.id}.message`);
-    if (ch) {
-      if (msg) {
-        // Replace all supported placeholders
-        msg = msg
-          .replace(/{user}/g,          `<@${user.id}>`)
-          .replace(/{username}/g,       user.username)
-          .replace(/{server}/g,         guild.name)
-          .replace(/{memberCount}/g,    guild.memberCount)
-          .replace(/{inviter}/g,        inviter ? `<@${inviter.id}>` : 'Unknown')
-          .replace(/{inviterTag}/g,     inviter?.tag ?? 'Unknown')
-          .replace(/{inviterCount}/g,   String(inviterCount));
-        ch.send(msg).catch(() => {});
+      if (!ch) {
+        console.error(`[welcome] ${guild.name}: channel ${chId} not found — was it deleted?`);
       } else {
-        // Default embed — shows inviter when known
-        const desc = inviter
-          ? `Hey <@${user.id}>, you are member **#${guild.memberCount}**!\n\nInvited by **${inviter.tag}** · **${inviterCount}** invite${inviterCount !== 1 ? 's' : ''}`
-          : `Hey <@${user.id}>, you are member **#${guild.memberCount}**!`;
-        ch.send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0x5865f2)
-              .setTitle(`Welcome to ${guild.name}!`)
-              .setDescription(desc)
-              .setThumbnail(user.displayAvatarURL())
-              .setTimestamp(),
-          ],
-        }).catch(() => {});
+        const perms = ch.permissionsFor(guild.members.me);
+        if (!perms?.has(PermissionFlagsBits.ViewChannel)) {
+          console.error(`[welcome] ${guild.name}: missing View Channel in #${ch.name}`);
+        } else if (!perms?.has(PermissionFlagsBits.SendMessages)) {
+          console.error(`[welcome] ${guild.name}: missing Send Messages in #${ch.name}`);
+        } else {
+          let msg = await db.get(`welcome.${guild.id}.message`);
+          if (msg) {
+            msg = msg
+              .replace(/{user}/g,         `<@${user.id}>`)
+              .replace(/{username}/g,      user.username)
+              .replace(/{server}/g,        guild.name)
+              .replace(/{memberCount}/g,   guild.memberCount)
+              .replace(/{inviter}/g,       inviter ? `<@${inviter.id}>` : 'Unknown')
+              .replace(/{inviterTag}/g,    inviter?.tag ?? 'Unknown')
+              .replace(/{inviterCount}/g,  String(inviterCount));
+            await ch.send(msg);
+          } else {
+            const desc = inviter
+              ? `Hey <@${user.id}>, you are member **#${guild.memberCount}**!\n\nInvited by **${inviter.tag}** · **${inviterCount}** invite${inviterCount !== 1 ? 's' : ''}`
+              : `Hey <@${user.id}>, you are member **#${guild.memberCount}**!`;
+            await ch.send({
+              embeds: [
+                new EmbedBuilder()
+                  .setColor(0x5865f2)
+                  .setTitle(`Welcome to ${guild.name}!`)
+                  .setDescription(desc)
+                  .setThumbnail(user.displayAvatarURL())
+                  .setTimestamp(),
+              ],
+            });
+          }
+          console.log(`[welcome] Sent welcome for ${user.tag} in ${guild.name}`);
+        }
       }
     }
+  } catch (e) {
+    console.error(`[welcome] ${guild.name}: error —`, e.message);
   }
 
   // ── Autorole ──────────────────────────────────────────────────
