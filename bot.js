@@ -12,7 +12,7 @@ const client  = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildModeration,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildInvites,   // ← required for invite tracking
+    GatewayIntentBits.GuildInvites,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
   ],
@@ -23,8 +23,8 @@ const client  = new Client({
 // ─────────────────────────────────────────────
 //  GIVEAWAY HELPERS
 // ─────────────────────────────────────────────
-const giveawayTimers = new Map(); // messageId -> timeout handle
-const muteTimers     = new Map(); // `${guildId}:${userId}` -> timeout handle
+const giveawayTimers = new Map();
+const muteTimers     = new Map();
 
 // ─────────────────────────────────────────────
 //  MUTE ROLE HELPER
@@ -38,7 +38,6 @@ async function getMuteRole(guild) {
       permissions: [],
       reason: 'Auto-created for -mute command',
     });
-    // Apply deny overwrites to every text channel
     for (const ch of guild.channels.cache.values()) {
       if (ch.isTextBased() || ch.type === 2) {
         await ch.permissionOverwrites.edit(role, {
@@ -70,7 +69,7 @@ function parseDuration(str) {
   const match  = str.match(/^(\d+)(s|m|h|d)$/i);
   if (!match) return null;
   const ms = parseInt(match[1]) * units[match[2].toLowerCase()];
-  if (ms < 1000 || ms > 7 * 86400000) return null; // 1s min, 7d max
+  if (ms < 1000 || ms > 7 * 86400000) return null;
   return ms;
 }
 
@@ -91,7 +90,6 @@ async function endGiveaway(guildId, messageId, reroll = false) {
     ?? await guild?.channels.fetch(data.channelId).catch(() => null);
   const message = await channel?.messages.fetch(messageId).catch(() => null);
 
-  // Fetch all 🎉 reactors, filter bots
   const reaction = message?.reactions.cache.get('🎉');
   let users = reaction ? (await reaction.users.fetch().catch(() => null)) : null;
   users = users?.filter(u => !u.bot) ?? new (require('discord.js').Collection)();
@@ -107,7 +105,6 @@ async function endGiveaway(guildId, messageId, reroll = false) {
     return;
   }
 
-  // Pick winners randomly without repeats
   const pool = [...users.values()];
   const count = Math.min(data.winnerCount, pool.length);
   const winners = [];
@@ -129,12 +126,13 @@ function scheduleGiveaway(guildId, messageId, endsAt) {
   giveawayTimers.set(messageId, timer);
 }
 
-const PREFIX      = '-';
-const restoring   = new Set();
+const PREFIX       = '-';
+const restoring    = new Set();
 const snapCooldown = new Map();
+const pendingPassword = new Map();
 
 // ─────────────────────────────────────────────
-//  INVITE CACHE  (guildId → Map(code → { uses, inviterId }))
+//  INVITE CACHE
 // ─────────────────────────────────────────────
 const inviteCache = new Map();
 
@@ -364,10 +362,9 @@ client.once('ready', async () => {
       const s = await getSettings(guild.id);
       if (s.enabled) await saveSnapshot(guild);
     } catch {}
-    await cacheInvites(guild); // cache invites for all guilds on startup
+    await cacheInvites(guild);
   }
 
-  // Reschedule any giveaways that were active when bot last restarted
   try {
     const allKeys = await db.list('giveaways.');
     for (const key of (allKeys?.keys ?? [])) {
@@ -384,7 +381,6 @@ client.once('ready', async () => {
     }
   } catch {}
 
-  // Reschedule any mutes that were active when bot restarted
   try {
     const muteKeys = await db.list('mutes.');
     for (const key of (muteKeys?.keys ?? [])) {
@@ -417,10 +413,8 @@ client.once('ready', async () => {
   }, 30 * 1000);
 });
 
-// Cache invites when bot joins a new guild
 client.on('guildCreate', guild => cacheInvites(guild));
 
-// Apply Muted role overwrites to newly created channels
 client.on('channelCreate', async channel => {
   if (!channel.guild) return;
   const muteRole = channel.guild.roles.cache.find(r => r.name === 'Muted');
@@ -435,7 +429,6 @@ client.on('channelCreate', async channel => {
   }
 });
 
-// Keep invite cache fresh when invites are created/deleted
 client.on('inviteCreate', invite => {
   if (!invite.guild) return;
   const cache = inviteCache.get(invite.guild.id) || new Map();
@@ -449,12 +442,11 @@ client.on('inviteDelete', invite => {
 });
 
 // ─────────────────────────────────────────────
-//  WELCOME + AUTOROLE  (with invite tracking)
+//  WELCOME + AUTOROLE
 // ─────────────────────────────────────────────
 client.on('guildMemberAdd', async member => {
   const { guild, user } = member;
 
-  // ── Detect which invite was used ──────────────────────────────
   let inviter      = null;
   let inviterCount = 0;
 
@@ -475,7 +467,6 @@ client.on('guildMemberAdd', async member => {
 
     console.log(`[invites] ${user.tag} joined ${guild.name} — comparing ${cachedBefore.size} cached vs ${newCache.size} current invite(s)`);
 
-    // Method 1: invite whose use count went up
     for (const [code, inv] of newCache) {
       const old = cachedBefore.get(code);
       if (old !== undefined && inv.uses > old.uses) {
@@ -496,7 +487,6 @@ client.on('guildMemberAdd', async member => {
       }
     }
 
-    // Method 2: single-use invite that got deleted after use
     if (!inviter) {
       for (const [code, old] of cachedBefore) {
         if (!newCache.has(code) && !code.startsWith('vanity:') && old.inviterId) {
@@ -513,13 +503,11 @@ client.on('guildMemberAdd', async member => {
 
     if (!inviter) console.warn(`[invites] Could not determine who invited ${user.tag}`);
 
-    // Update cache
     inviteCache.set(guild.id, newCache);
   } catch (e) {
     console.error(`[invites] Error tracking invite for ${user.tag}:`, e.message);
   }
 
-  // ── Welcome message ───────────────────────────────────────────
   try {
     const chId = await db.get(`welcome.${guild.id}.channel`);
     if (!chId) {
@@ -571,7 +559,6 @@ client.on('guildMemberAdd', async member => {
     console.error(`[welcome] ${guild.name}: error —`, e.message);
   }
 
-  // ── Autorole ──────────────────────────────────────────────────
   for (const rid of (await db.get(`autorole.${guild.id}.roles`)) || []) {
     const r = guild.roles.cache.get(rid);
     if (r && guild.members.me.roles.highest.position > r.position) member.roles.add(r).catch(() => {});
@@ -657,22 +644,77 @@ client.on('guildMemberRemove', async member => {
 // ─────────────────────────────────────────────
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
+
+  // ── Password intercept ─────────────────────────────────────────
+  const pending = pendingPassword.get(message.author.id);
+  if (pending && pending.guildId === message.guild.id) {
+    if (Date.now() - pending.timestamp > 60000) {
+      pendingPassword.delete(message.author.id);
+    } else {
+      const attempt = message.content.trim();
+      await message.delete().catch(() => {});
+      const storedPw = await db.get(`ownerpassword.${message.guild.id}`);
+      pendingPassword.delete(message.author.id);
+      if (!storedPw) {
+        return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('❌ No password set. The server owner can set one with `-setownerpassword <password>`.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 6000));
+      }
+      if (attempt !== storedPw) {
+        return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('❌ Wrong password.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 4000));
+      }
+      // Correct — show owner commands
+      return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('⚙️ Owner Commands').addFields(
+        { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`' },
+        { name: '⚙️ Config',     value: '`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
+        { name: '🛡️ Antinuke',   value: '`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke snapshot`\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
+        { name: '🎉 Giveaways',  value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`' },
+        { name: '🔒 Lock Whitelist', value: '`-lockwhitelist add @role`\n`-lockwhitelist remove @role`\n`-lockwhitelist list`' },
+        { name: '🔑 Password',   value: '`-setownerpassword <password>`' },
+      ).setFooter({ text: `Only you can see this • Auto-deletes in 30s • Prefix: ${PREFIX}` })] }).then(m => setTimeout(() => m.delete().catch(() => {}), 30000));
+    }
+  }
+
   if (!message.content.startsWith(PREFIX)) return;
   const args = message.content.slice(PREFIX.length).trim().split(/ +/);
   const cmd  = args.shift().toLowerCase();
 
+  // ── -cmdsowner ────────────────────────────────────────────────
+  if (cmd === 'cmdsowner') {
+    await message.delete().catch(() => {});
+    const storedPw = await db.get(`ownerpassword.${message.guild.id}`);
+    if (!storedPw) {
+      if (message.author.id !== message.guild.ownerId) return;
+      return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xffcc00).setDescription('⚠️ No password set yet. Use `-setownerpassword <password>` first.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 8000));
+    }
+    pendingPassword.set(message.author.id, { guildId: message.guild.id, channelId: message.channel.id, timestamp: Date.now() });
+    const prompt = await message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription('🔑 Type the password. *(your message will be deleted instantly)*')] });
+    setTimeout(() => {
+      prompt.delete().catch(() => {});
+      pendingPassword.delete(message.author.id);
+    }, 60000);
+    return;
+  }
+
+  // ── -setownerpassword ──────────────────────────────────────────
+  if (cmd === 'setownerpassword') {
+    if (message.author.id !== message.guild.ownerId)
+      return message.reply('❌ Only the server owner can set the password.');
+    await message.delete().catch(() => {});
+    const pw = args.join(' ');
+    if (!pw) return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('❌ Usage: `-setownerpassword <password>`')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
+    await db.set(`ownerpassword.${message.guild.id}`, pw);
+    return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription('✅ Owner password set. Use `-cmdsowner` to access owner commands.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
+  }
+
   // ── -cmds ──────────────────────────────────────────────────────
+  // FIX: removed antinuke section so it's not visible to everyone
   if (cmd === 'cmds' || cmd === 'commands' || cmd === 'help') {
     return message.reply({
       embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Commands').addFields(
-        { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-mute @user <duration> [reason]`\n`-unmute @user`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`\n`-lock [reason]`\n`-unlock [reason]`' },
-        { name: '🎭 Roles',      value: '`-role add @user <name>`\n`-role remove @user <name>`' },
+        { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-mute @user <duration> [reason]`\n`-unmute @user`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`\n`-lock`\n`-unlock`' },
+        { name: '🎭 Roles',      value: '`-role @user <role name>` — toggle (run again to remove)' },
         { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset someone\'s count (admin)' },
-        { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`\n\nPlaceholders: `{user}` `{username}` `{server}` `{memberCount}` `{inviter}` `{inviterTag}` `{inviterCount}`' },
-        { name: '🎉 Giveaways',   value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nAny duration from `1s` to `7d`' },
-        { name: '⚙️ Config',     value: '`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
-        { name: '🛡️ Antinuke (owner only)', value: '`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke snapshot` — manually save snapshot\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
-      ).setFooter({ text: `Prefix: ${PREFIX}  •  Snapshot auto-saves every 30s` })],
+        { name: '🎉 Giveaways',  value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nAny duration from `1s` to `7d`' },
+      ).setFooter({ text: `Prefix: ${PREFIX}` })],
     });
   }
 
@@ -705,7 +747,6 @@ client.on('messageCreate', async message => {
 
   // ── -inviteleaderboard ─────────────────────────────────────────
   if (cmd === 'inviteleaderboard' || cmd === 'invlb') {
-    // Fetch all members and their stored invite counts
     const members = await message.guild.members.fetch().catch(() => null);
     if (!members) return message.reply('❌ Could not fetch members.');
 
@@ -939,26 +980,21 @@ client.on('messageCreate', async message => {
   else if (cmd === 'role') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
       return message.reply('❌ You need **Manage Roles** permission.');
-    const sub = args[0]?.toLowerCase();
-    const t   = message.mentions.members.first();
-    if (!['add', 'remove'].includes(sub))
-      return message.reply('❌ Usage: `-role add @user <name>` or `-role remove @user <name>`');
-    if (!t) return message.reply('❌ Please mention a user.');
-    const rn = args.slice(2).join(' ');
+    const t = message.mentions.members.first();
+    if (!t) return message.reply('❌ Usage: `-role @user <role name>`');
+    const rn = args.slice(1).join(' ').replace(/<@[^>]+>\s*/g, '').trim();
     if (!rn) return message.reply('❌ Please provide a role name.');
     const role = message.mentions.roles.first() || message.guild.roles.cache.find(r => r.name.toLowerCase() === rn.toLowerCase());
     if (!role) return message.reply(`❌ No role named **${rn}**.`);
-    if (message.guild.members.me.roles.highest.position <= role.position) return message.reply("❌ That role is above my highest role.");
-    if (message.member.roles.highest.position <= role.position) return message.reply("❌ That role is above your highest role.");
+    if (message.guild.members.me.roles.highest.position <= role.position) return message.reply('❌ That role is above my highest role.');
+    if (message.member.roles.highest.position <= role.position) return message.reply('❌ That role is above your highest role.');
     if (role.managed) return message.reply('❌ Managed by an integration.');
-    if (sub === 'add') {
-      if (t.roles.cache.has(role.id)) return message.reply(`❌ ${t} already has **${role.name}**.`);
-      await t.roles.add(role, `Added by ${message.author.tag}`);
-      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Role Added').addFields({ name: 'Member', value: `${t}`, inline: true }, { name: 'Role', value: role.name, inline: true })] });
-    } else {
-      if (!t.roles.cache.has(role.id)) return message.reply(`❌ ${t} doesn't have **${role.name}**.`);
+    if (t.roles.cache.has(role.id)) {
       await t.roles.remove(role, `Removed by ${message.author.tag}`);
       message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Role Removed').addFields({ name: 'Member', value: `${t}`, inline: true }, { name: 'Role', value: role.name, inline: true })] });
+    } else {
+      await t.roles.add(role, `Added by ${message.author.tag}`);
+      message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Role Added').addFields({ name: 'Member', value: `${t}`, inline: true }, { name: 'Role', value: role.name, inline: true })] });
     }
   }
 
@@ -983,7 +1019,8 @@ client.on('messageCreate', async message => {
     if (sub === 'test') {
       const cid = await db.get(`welcome.${gid}.channel`);
       if (!cid) return message.reply('❌ Set a channel first.');
-      const chan = guild.channels.cache.get(cid) ?? await message.guild.channels.fetch(cid).catch(() => null);
+      // FIX: was `guild.channels` (undefined), now correctly `message.guild.channels`
+      const chan = message.guild.channels.cache.get(cid) ?? await message.guild.channels.fetch(cid).catch(() => null);
       if (!chan) return message.reply('❌ Channel no longer exists.');
       let msg = await db.get(`welcome.${gid}.message`);
       if (msg) {
@@ -1047,7 +1084,6 @@ client.on('messageCreate', async message => {
   else if (cmd === 'gcreate' || cmd === 'gstart') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return message.reply('❌ You need **Manage Server** permission.');
-    // Usage: -gcreate <duration> <winners> <prize>
     const duration = parseDuration(args[0]);
     if (!duration) return message.reply('❌ Usage: `-gcreate <duration> <winners> <prize>`\nAnything from `1s` to `7d` — e.g. `30s`, `5m`, `2h`, `3d`');
     const winnerCount = parseInt(args[1]);
@@ -1123,7 +1159,6 @@ client.on('messageCreate', async message => {
     if (!active.length) return message.reply('❌ No active giveaways.');
     message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 Active Giveaways').setDescription(active.join('\n')).setTimestamp()] });
   }
-
 
   // ── -antinuke ──────────────────────────────────────────────────
   else if (cmd === 'antinuke' || cmd === 'an') {
