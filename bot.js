@@ -1,7 +1,7 @@
 const {
   Client, GatewayIntentBits, Partials,
   EmbedBuilder, PermissionFlagsBits,
-  AuditLogEvent, ActivityType,
+  AuditLogEvent, ActivityType, Collection,
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
 
@@ -65,6 +65,7 @@ async function unmuteUser(guild, userId, reason) {
 }
 
 function parseDuration(str) {
+  if (!str) return null;
   const units = { s: 1000, m: 60000, h: 3600000, d: 86400000 };
   const match  = str.match(/^(\d+)(s|m|h|d)$/i);
   if (!match) return null;
@@ -80,31 +81,51 @@ function formatDuration(ms) {
   return `${Math.round(ms / 1000)}s`;
 }
 
+// ─────────────────────────────────────────────
+//  GIVEAWAY END  (fixed)
+// ─────────────────────────────────────────────
 async function endGiveaway(guildId, messageId, reroll = false) {
   const data = await db.get(`giveaways.${guildId}.${messageId}`);
-  if (!data) return;
+  if (!data) return console.warn(`[giveaway] No data for ${messageId}`);
   if (!reroll && !data.active) return;
 
-  const guild   = client.guilds.cache.get(guildId);
-  const channel = guild?.channels.cache.get(data.channelId)
-    ?? await guild?.channels.fetch(data.channelId).catch(() => null);
-  const message = await channel?.messages.fetch(messageId).catch(() => null);
-
-  const reaction = message?.reactions.cache.get('🎉');
-  let users = reaction ? (await reaction.users.fetch().catch(() => null)) : null;
-  users = users?.filter(u => !u.bot) ?? new (require('discord.js').Collection)();
-
+  // Clear the timer to prevent a double-fire if -gend is used while timer is running
   if (!reroll) {
-    await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false });
+    clearTimeout(giveawayTimers.get(messageId));
     giveawayTimers.delete(messageId);
   }
 
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return console.error(`[giveaway] Guild not found: ${guildId}`);
+
+  let channel = guild.channels.cache.get(data.channelId);
+  if (!channel) channel = await guild.channels.fetch(data.channelId).catch(() => null);
+  if (!channel) return console.error(`[giveaway] Channel not found: ${data.channelId}`);
+
+  // Always fetch fresh from API so reactions are up to date
+  const msg = await channel.messages.fetch(messageId).catch(() => null);
+  if (!msg) return console.error(`[giveaway] Message not found: ${messageId}`);
+
+  // Use find() instead of get() — more reliable for emoji matching
+  const reaction = msg.reactions.cache.find(r => r.emoji.name === '🎉');
+  let users = new Collection();
+  if (reaction) {
+    const fetched = await reaction.users.fetch().catch(() => null);
+    if (fetched) users = fetched.filter(u => !u.bot);
+  }
+
+  // Mark inactive and save AFTER fetching users so a silent error doesn't kill the giveaway
+  if (!reroll) {
+    await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false });
+  }
+
   if (users.size === 0) {
-    await message?.edit({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🎉 GIVEAWAY ENDED').setDescription(`**${data.prize}**\n\nNo valid entries — no winner.`).setFooter({ text: `${data.winnerCount} winner(s) • Ended` }).setTimestamp()] }).catch(() => {});
-    await channel?.send({ embeds: [new EmbedBuilder().setColor(0xff4444).setDescription(`🎉 The giveaway for **${data.prize}** ended with no valid entries.`)] }).catch(() => {});
+    await msg.edit({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🎉 GIVEAWAY ENDED').setDescription(`**${data.prize}**\n\nNo valid entries — no winner.`).setFooter({ text: `${data.winnerCount} winner(s) • Ended` }).setTimestamp()] }).catch(() => {});
+    await channel.send({ embeds: [new EmbedBuilder().setColor(0xff4444).setDescription(`🎉 The giveaway for **${data.prize}** ended with no valid entries.`)] }).catch(() => {});
     return;
   }
 
+  // Pick winners randomly without repeats
   const pool = [...users.values()];
   const count = Math.min(data.winnerCount, pool.length);
   const winners = [];
@@ -114,16 +135,23 @@ async function endGiveaway(guildId, messageId, reroll = false) {
   }
 
   const mentions = winners.map(w => `<@${w.id}>`).join(', ');
-  await message?.edit({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 GIVEAWAY ENDED').setDescription(`**${data.prize}**\n\n🏆 Winner${count > 1 ? 's' : ''}: ${mentions}`).setFooter({ text: `${count} winner(s) • Ended` }).setTimestamp()] }).catch(() => {});
-  await channel?.send({ content: mentions, embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🎉 Congrats ${mentions}! You won **${data.prize}**!\n\n*Hosted by <@${data.hostId}>*`)] }).catch(() => {});
+  await msg.edit({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 GIVEAWAY ENDED').setDescription(`**${data.prize}**\n\n🏆 Winner${count > 1 ? 's' : ''}: ${mentions}`).setFooter({ text: `${count} winner(s) • Ended` }).setTimestamp()] }).catch(() => {});
+  await channel.send({ content: mentions, embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🎉 Congrats ${mentions}! You won **${data.prize}**!\n\n*Hosted by <@${data.hostId}>*`)] }).catch(() => {});
 
-  if (!reroll) await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false, lastWinners: winners.map(w => w.id) });
+  if (!reroll) {
+    await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false, lastWinners: winners.map(w => w.id) });
+  }
+
+  console.log(`[giveaway] Ended ${messageId} in ${guild.name} — winners: ${winners.map(w => w.tag).join(', ')}`);
 }
 
 function scheduleGiveaway(guildId, messageId, endsAt) {
+  // Clear any existing timer for this giveaway before setting a new one
+  if (giveawayTimers.has(messageId)) clearTimeout(giveawayTimers.get(messageId));
   const delay = Math.max(endsAt - Date.now(), 0);
   const timer = setTimeout(() => endGiveaway(guildId, messageId), delay);
   giveawayTimers.set(messageId, timer);
+  console.log(`[giveaway] Scheduled ${messageId} to end in ${formatDuration(delay)}`);
 }
 
 const PREFIX       = '-';
@@ -148,7 +176,6 @@ async function cacheInvites(guild) {
     console.log(`[invites] Cached ${cache.size} invite(s) for ${guild.name}`);
   } catch (e) {
     console.error(`[invites] Failed to cache invites for ${guild.name}:`, e.message);
-    console.error(`[invites] Make sure the bot has Manage Server permission and GuildInvites intent is ON in the Developer Portal`);
   }
 }
 
@@ -293,22 +320,15 @@ async function autoRestore(guild) {
 
     const catMap = new Map();
     const categories = snapshot.filter(c => c.type === 4);
-    console.log(`[restore] Creating ${categories.length} categories`);
-
     for (const ch of categories) {
       try {
         const existing = guild.channels.cache.find(c => c.name === ch.name && c.type === 4);
-        if (existing) {
-          catMap.set(ch.id, existing.id);
-          skipped++;
-          continue;
-        }
+        if (existing) { catMap.set(ch.id, existing.id); skipped++; continue; }
         const newCh = await makeChannel(guild, {
           name: ch.name, type: ch.type, position: ch.position,
           permissionOverwrites: buildPerms(ch.permissionOverwrites),
         });
-        if (newCh) { catMap.set(ch.id, newCh.id); restored++; }
-        else failed++;
+        if (newCh) { catMap.set(ch.id, newCh.id); restored++; } else failed++;
       } catch { failed++; }
       await new Promise(r => setTimeout(r, 500));
     }
@@ -339,7 +359,6 @@ async function autoRestore(guild) {
     const msg = `✅ Done — removed **${removed}** nuke channels, restored **${restored}**${skipped ? `, skipped **${skipped}**` : ''}${failed ? `, **${failed}** failed` : ''}.`;
     console.log(`[restore] ${msg}`);
     await sendLog(guild, msg);
-
   } catch (e) {
     console.error('[autoRestore fatal]', e);
   } finally {
@@ -365,28 +384,43 @@ client.once('ready', async () => {
     await cacheInvites(guild);
   }
 
+  // ── Reschedule active giveaways on restart ──────────────────
+  // Uses db.all() which works across all quick.db v9 versions
   try {
-    const allKeys = await db.list('giveaways.');
-    for (const key of (allKeys?.keys ?? [])) {
-      const data = await db.get(key);
-      if (data?.active) {
-        const parts = key.split('.');
-        const [guildId, messageId] = [parts[1], parts[2]];
-        if (Date.now() >= data.endsAt) {
-          endGiveaway(guildId, messageId);
-        } else {
-          scheduleGiveaway(guildId, messageId, data.endsAt);
-        }
+    const allEntries = await db.all();
+    const giveawayEntries = allEntries.filter(e =>
+      e.id.startsWith('giveaways.') && e.id.split('.').length === 3
+    );
+    let rescheduled = 0;
+    for (const entry of giveawayEntries) {
+      const data = entry.value;
+      if (!data?.active) continue;
+      const parts     = entry.id.split('.');
+      const guildId   = parts[1];
+      const messageId = parts[2];
+      if (Date.now() >= data.endsAt) {
+        // Already expired while bot was offline — end immediately
+        endGiveaway(guildId, messageId);
+      } else {
+        scheduleGiveaway(guildId, messageId, data.endsAt);
+        rescheduled++;
       }
     }
-  } catch {}
+    if (rescheduled > 0) console.log(`[giveaway] Rescheduled ${rescheduled} active giveaway(s)`);
+  } catch (e) {
+    console.error('[giveaway] Failed to reschedule on startup:', e.message);
+  }
 
+  // ── Reschedule active mutes on restart ──────────────────────
   try {
-    const muteKeys = await db.list('mutes.');
-    for (const key of (muteKeys?.keys ?? [])) {
-      const data = await db.get(key);
+    const allEntries = await db.all();
+    const muteEntries = allEntries.filter(e =>
+      e.id.startsWith('mutes.') && e.id.split('.').length === 3
+    );
+    for (const entry of muteEntries) {
+      const data = entry.value;
       if (!data) continue;
-      const parts   = key.split('.');
+      const parts   = entry.id.split('.');
       const guildId = parts[1], userId = parts[2];
       const guild   = client.guilds.cache.get(guildId);
       if (!guild) continue;
@@ -398,7 +432,9 @@ client.once('ready', async () => {
         muteTimers.set(`${guildId}:${userId}`, timer);
       }
     }
-  } catch {}
+  } catch (e) {
+    console.error('[mute] Failed to reschedule mutes on startup:', e.message);
+  }
 
   setInterval(async () => {
     for (const guild of client.guilds.cache.values()) {
@@ -446,47 +482,31 @@ client.on('inviteDelete', invite => {
 // ─────────────────────────────────────────────
 client.on('guildMemberAdd', async member => {
   const { guild, user } = member;
-
   let inviter      = null;
   let inviterCount = 0;
 
   try {
-    const oldCache = inviteCache.get(guild.id);
-    if (!oldCache) {
-      console.warn(`[invites] No cached invites for ${guild.name} — was cacheInvites called? Check Manage Server permission + GuildInvites intent in Developer Portal`);
-    }
-    const cachedBefore = oldCache || new Map();
-
-    const newInvites = await guild.invites.fetch();
-    const newCache   = new Map(newInvites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]));
-
+    const cachedBefore = inviteCache.get(guild.id) || new Map();
+    const newInvites   = await guild.invites.fetch();
+    const newCache     = new Map(newInvites.map(i => [i.code, { uses: i.uses, inviterId: i.inviter?.id ?? null }]));
     try {
       const vanity = await guild.fetchVanityData();
       if (vanity?.code) newCache.set(`vanity:${vanity.code}`, { uses: vanity.uses, inviterId: null });
     } catch {}
 
-    console.log(`[invites] ${user.tag} joined ${guild.name} — comparing ${cachedBefore.size} cached vs ${newCache.size} current invite(s)`);
-
     for (const [code, inv] of newCache) {
       const old = cachedBefore.get(code);
       if (old !== undefined && inv.uses > old.uses) {
-        if (code.startsWith('vanity:')) {
-          console.log(`[invites] ${user.tag} joined via vanity URL`);
-        } else {
-          const inviterId = inv.inviterId;
-          if (inviterId) {
-            inviter = await client.users.fetch(inviterId).catch(() => null);
-            const key     = `invites.${guild.id}.${inviterId}`;
-            const current = (await db.get(key)) ?? 0;
-            await db.set(key, current + 1);
-            inviterCount = current + 1;
-            console.log(`[invites] ${user.tag} was invited by ${inviter?.tag ?? inviterId} (${inviterCount} total invites)`);
-          }
+        if (!code.startsWith('vanity:') && inv.inviterId) {
+          inviter = await client.users.fetch(inv.inviterId).catch(() => null);
+          const key     = `invites.${guild.id}.${inv.inviterId}`;
+          const current = (await db.get(key)) ?? 0;
+          await db.set(key, current + 1);
+          inviterCount = current + 1;
         }
         break;
       }
     }
-
     if (!inviter) {
       for (const [code, old] of cachedBefore) {
         if (!newCache.has(code) && !code.startsWith('vanity:') && old.inviterId) {
@@ -495,14 +515,10 @@ client.on('guildMemberAdd', async member => {
           const current = (await db.get(key)) ?? 0;
           await db.set(key, current + 1);
           inviterCount = current + 1;
-          console.log(`[invites] ${user.tag} used a single-use invite from ${inviter?.tag ?? old.inviterId}`);
           break;
         }
       }
     }
-
-    if (!inviter) console.warn(`[invites] Could not determine who invited ${user.tag}`);
-
     inviteCache.set(guild.id, newCache);
   } catch (e) {
     console.error(`[invites] Error tracking invite for ${user.tag}:`, e.message);
@@ -510,48 +526,28 @@ client.on('guildMemberAdd', async member => {
 
   try {
     const chId = await db.get(`welcome.${guild.id}.channel`);
-    if (!chId) {
-      console.log(`[welcome] ${guild.name}: no channel set, skipping`);
-    } else {
-      const ch = guild.channels.cache.get(chId)
-        ?? await guild.channels.fetch(chId).catch(() => null);
-
-      if (!ch) {
-        console.error(`[welcome] ${guild.name}: channel ${chId} not found — was it deleted?`);
-      } else {
+    if (chId) {
+      const ch = guild.channels.cache.get(chId) ?? await guild.channels.fetch(chId).catch(() => null);
+      if (ch) {
         const perms = ch.permissionsFor(guild.members.me);
-        if (!perms?.has(PermissionFlagsBits.ViewChannel)) {
-          console.error(`[welcome] ${guild.name}: missing View Channel in #${ch.name}`);
-        } else if (!perms?.has(PermissionFlagsBits.SendMessages)) {
-          console.error(`[welcome] ${guild.name}: missing Send Messages in #${ch.name}`);
-        } else {
+        if (perms?.has(PermissionFlagsBits.ViewChannel) && perms?.has(PermissionFlagsBits.SendMessages)) {
           let msg = await db.get(`welcome.${guild.id}.message`);
           if (msg) {
             msg = msg
-              .replace(/{user}/g,         `<@${user.id}>`)
-              .replace(/{username}/g,      user.username)
-              .replace(/{server}/g,        guild.name)
-              .replace(/{memberCount}/g,   guild.memberCount)
-              .replace(/{inviter}/g,       inviter ? `<@${inviter.id}>` : 'Unknown')
-              .replace(/{inviterTag}/g,    inviter?.tag ?? 'Unknown')
-              .replace(/{inviterCount}/g,  String(inviterCount));
+              .replace(/{user}/g,        `<@${user.id}>`)
+              .replace(/{username}/g,     user.username)
+              .replace(/{server}/g,       guild.name)
+              .replace(/{memberCount}/g,  guild.memberCount)
+              .replace(/{inviter}/g,      inviter ? `<@${inviter.id}>` : 'Unknown')
+              .replace(/{inviterTag}/g,   inviter?.tag ?? 'Unknown')
+              .replace(/{inviterCount}/g, String(inviterCount));
             await ch.send(msg);
           } else {
             const desc = inviter
               ? `Hey <@${user.id}>, you are member **#${guild.memberCount}**!\n\nInvited by **${inviter.tag}** · **${inviterCount}** invite${inviterCount !== 1 ? 's' : ''}`
               : `Hey <@${user.id}>, you are member **#${guild.memberCount}**!`;
-            await ch.send({
-              embeds: [
-                new EmbedBuilder()
-                  .setColor(0x5865f2)
-                  .setTitle(`Welcome to ${guild.name}!`)
-                  .setDescription(desc)
-                  .setThumbnail(user.displayAvatarURL())
-                  .setTimestamp(),
-              ],
-            });
+            await ch.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${guild.name}!`).setDescription(desc).setThumbnail(user.displayAvatarURL()).setTimestamp()] });
           }
-          console.log(`[welcome] Sent welcome for ${user.tag} in ${guild.name}`);
         }
       }
     }
@@ -571,31 +567,21 @@ client.on('guildMemberAdd', async member => {
 client.on('channelDelete', async channel => {
   if (!channel.guild || restoring.has(channel.guild.id)) return;
   const { guild } = channel;
-
   const capturedChannels = [...guild.channels.cache.values()];
-  if (!capturedChannels.find(c => c.id === channel.id)) {
-    capturedChannels.push(channel);
-  }
-
+  if (!capturedChannels.find(c => c.id === channel.id)) capturedChannels.push(channel);
   prefetch(guild, AuditLogEvent.ChannelDelete);
-
   const now = Date.now();
   const lastSnap = snapCooldown.get(guild.id) || 0;
   if (now - lastSnap > 5000) {
     snapCooldown.set(guild.id, now);
     db.set(`snap.${guild.id}`, capturedChannels.map(snapCh)).catch(() => {});
     db.set(`snap.${guild.id}.time`, now).catch(() => {});
-    console.log(`[snap] ${guild.name}: captured ${capturedChannels.length} channels on deletion`);
   }
-
   if (!crossed(counters.ch, guild.id)) return;
-
   const s = await getSettings(guild.id);
   if (!s.enabled) return;
-
   const exec = await getExec(guild, AuditLogEvent.ChannelDelete);
   if (!exec || trusted(s, exec.id, guild.ownerId, guild.members.me?.id)) return;
-
   await sendLog(guild, `🚨 **Antinuke** — **${exec.tag}** is nuking! Banning + restoring…`);
   await punish(guild, exec.id);
   autoRestore(guild);
@@ -661,14 +647,13 @@ client.on('messageCreate', async message => {
       if (attempt !== storedPw) {
         return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('❌ Wrong password.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 4000));
       }
-      // Correct — show owner commands
       return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('⚙️ Owner Commands').addFields(
-        { name: '👋 Welcome',    value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`' },
-        { name: '⚙️ Config',     value: '`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
-        { name: '🛡️ Antinuke',   value: '`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke snapshot`\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
-        { name: '🎉 Giveaways',  value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`' },
+        { name: '👋 Welcome',        value: '`-setwelcome #channel`\n`-setwelcome message <text>`\n`-setwelcome disable`\n`-setwelcome test`' },
+        { name: '⚙️ Config',         value: '`-autorole add @role`\n`-autorole remove @role`\n`-autorole list`' },
+        { name: '🛡️ Antinuke',       value: '`-antinuke enable`\n`-antinuke disable`\n`-antinuke setlog #channel`\n`-antinuke whitelist add/remove @user`\n`-antinuke snapshot`\n`-antinuke status`\n`-antinuke restore`\n`-antinuke restore clear`' },
+        { name: '🎉 Giveaways',      value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`' },
         { name: '🔒 Lock Whitelist', value: '`-lockwhitelist add @role`\n`-lockwhitelist remove @role`\n`-lockwhitelist list`' },
-        { name: '🔑 Password',   value: '`-setownerpassword <password>`' },
+        { name: '🔑 Password',       value: '`-setownerpassword <password>`' },
       ).setFooter({ text: `Only you can see this • Auto-deletes in 30s • Prefix: ${PREFIX}` })] }).then(m => setTimeout(() => m.delete().catch(() => {}), 30000));
     }
   }
@@ -687,10 +672,7 @@ client.on('messageCreate', async message => {
     }
     pendingPassword.set(message.author.id, { guildId: message.guild.id, channelId: message.channel.id, timestamp: Date.now() });
     const prompt = await message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription('🔑 Type the password. *(your message will be deleted instantly)*')] });
-    setTimeout(() => {
-      prompt.delete().catch(() => {});
-      pendingPassword.delete(message.author.id);
-    }, 60000);
+    setTimeout(() => { prompt.delete().catch(() => {}); pendingPassword.delete(message.author.id); }, 60000);
     return;
   }
 
@@ -706,13 +688,12 @@ client.on('messageCreate', async message => {
   }
 
   // ── -cmds ──────────────────────────────────────────────────────
-  // FIX: removed antinuke section so it's not visible to everyone
   if (cmd === 'cmds' || cmd === 'commands' || cmd === 'help') {
     return message.reply({
       embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Commands').addFields(
         { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-mute @user <duration> [reason]`\n`-unmute @user`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`\n`-lock`\n`-unlock`' },
         { name: '🎭 Roles',      value: '`-role @user <role name>` — toggle (run again to remove)' },
-        { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset someone\'s count (admin)' },
+        { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset count (admin)' },
         { name: '🎉 Giveaways',  value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nAny duration from `1s` to `7d`' },
       ).setFooter({ text: `Prefix: ${PREFIX}` })],
     });
@@ -720,9 +701,8 @@ client.on('messageCreate', async message => {
 
   // ── -invites ───────────────────────────────────────────────────
   if (cmd === 'invites') {
-    const isReset  = args[0]?.toLowerCase() === 'reset';
-    const target   = message.mentions.users.first() ?? message.author;
-
+    const isReset = args[0]?.toLowerCase() === 'reset';
+    const target  = message.mentions.users.first() ?? message.author;
     if (isReset) {
       if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
         return message.reply('❌ You need **Manage Server** permission.');
@@ -731,47 +711,24 @@ client.on('messageCreate', async message => {
       await db.set(`invites.${message.guild.id}.${resetTarget.id}`, 0);
       return message.reply(`✅ Reset invite count for **${resetTarget.tag}**.`);
     }
-
     const count = (await db.get(`invites.${message.guild.id}.${target.id}`)) ?? 0;
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x5865f2)
-          .setTitle('📨 Invite Count')
-          .setDescription(`**${target.tag}** has **${count}** invite${count !== 1 ? 's' : ''} in **${message.guild.name}**.`)
-          .setThumbnail(target.displayAvatarURL())
-          .setTimestamp(),
-      ],
-    });
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📨 Invite Count').setDescription(`**${target.tag}** has **${count}** invite${count !== 1 ? 's' : ''} in **${message.guild.name}**.`).setThumbnail(target.displayAvatarURL()).setTimestamp()] });
   }
 
   // ── -inviteleaderboard ─────────────────────────────────────────
   if (cmd === 'inviteleaderboard' || cmd === 'invlb') {
     const members = await message.guild.members.fetch().catch(() => null);
     if (!members) return message.reply('❌ Could not fetch members.');
-
     const entries = [];
     for (const [uid] of members) {
       const count = (await db.get(`invites.${message.guild.id}.${uid}`)) ?? 0;
       if (count > 0) entries.push({ uid, count });
     }
-
     entries.sort((a, b) => b.count - a.count);
     const top = entries.slice(0, 10);
-
     if (!top.length) return message.reply('❌ No invite data yet.');
-
     const lines = top.map((e, i) => `**${i + 1}.** <@${e.uid}> — **${e.count}** invite${e.count !== 1 ? 's' : ''}`);
-    return message.reply({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x5865f2)
-          .setTitle('📨 Invite Leaderboard')
-          .setDescription(lines.join('\n'))
-          .setFooter({ text: `${message.guild.name} • Top ${top.length}` })
-          .setTimestamp(),
-      ],
-    });
+    return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📨 Invite Leaderboard').setDescription(lines.join('\n')).setFooter({ text: `${message.guild.name} • Top ${top.length}` }).setTimestamp()] });
   }
 
   // ── -ban ───────────────────────────────────────────────────────
@@ -784,8 +741,7 @@ client.on('messageCreate', async message => {
     if (t.id === message.author.id) return message.reply('❌ Cannot ban yourself.');
     if (t.id === message.guild.ownerId) return message.reply('❌ Cannot ban the server owner.');
     if (!t.bannable) return message.reply("❌ I can't ban that user.");
-    if (message.member.roles.highest.position <= t.roles.highest.position)
-      return message.reply('❌ That user has an equal or higher role.');
+    if (message.member.roles.highest.position <= t.roles.highest.position) return message.reply('❌ That user has an equal or higher role.');
     await t.send({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle(`Banned from ${message.guild.name}`).addFields({ name: 'Reason', value: r })] }).catch(() => {});
     await t.ban({ reason: `${message.author.tag}: ${r}` });
     message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔨 Banned').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
@@ -801,8 +757,7 @@ client.on('messageCreate', async message => {
     if (t.id === message.author.id) return message.reply('❌ Cannot kick yourself.');
     if (t.id === message.guild.ownerId) return message.reply('❌ Cannot kick the server owner.');
     if (!t.kickable) return message.reply("❌ I can't kick that user.");
-    if (message.member.roles.highest.position <= t.roles.highest.position)
-      return message.reply('❌ That user has an equal or higher role.');
+    if (message.member.roles.highest.position <= t.roles.highest.position) return message.reply('❌ That user has an equal or higher role.');
     await t.send({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle(`Kicked from ${message.guild.name}`).addFields({ name: 'Reason', value: r })] }).catch(() => {});
     await t.kick(`${message.author.tag}: ${r}`);
     message.reply({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle('👢 Kicked').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
@@ -814,18 +769,15 @@ client.on('messageCreate', async message => {
       return message.reply('❌ You need **Manage Roles** permission.');
     const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
     if (!t) return message.reply('❌ Usage: `-mute @user <duration> [reason]`\nDurations: `30s` `5m` `1h` `12h` `1d` `7d`');
-    const durArg = args[1]?.toLowerCase();
-    const ms = parseDuration(durArg);
+    const ms = parseDuration(args[1]?.toLowerCase());
     if (!ms) return message.reply('❌ Invalid duration. Examples: `30s` `5m` `1h` `12h` `1d` `7d`');
     const r = args.slice(2).join(' ') || 'No reason provided';
     if (t.id === message.author.id) return message.reply('❌ Cannot mute yourself.');
     if (t.id === message.guild.ownerId) return message.reply('❌ Cannot mute the server owner.');
-    if (message.member.roles.highest.position <= t.roles.highest.position)
-      return message.reply('❌ That user has an equal or higher role.');
+    if (message.member.roles.highest.position <= t.roles.highest.position) return message.reply('❌ That user has an equal or higher role.');
     const muteRole = await getMuteRole(message.guild).catch(() => null);
     if (!muteRole) return message.reply('❌ Failed to create/find the Muted role.');
-    if (message.guild.members.me.roles.highest.position <= muteRole.position)
-      return message.reply('❌ The Muted role is above my highest role — move it below my role.');
+    if (message.guild.members.me.roles.highest.position <= muteRole.position) return message.reply('❌ The Muted role is above my highest role — move it below my role.');
     if (t.roles.cache.has(muteRole.id)) return message.reply('❌ That user is already muted.');
     await t.roles.add(muteRole, `Muted by ${message.author.tag}: ${r}`);
     const endsAt = Date.now() + ms;
@@ -890,14 +842,11 @@ client.on('messageCreate', async message => {
       return message.reply('❌ You need **Manage Messages** permission.');
     const fm = message.mentions.members.first();
     const amount = parseInt(fm ? args[1] : args[0]);
-    if (isNaN(amount) || amount < 1 || amount > 100)
-      return message.reply('❌ Usage: `-purge <1-100>` or `-purge @user <1-100>`');
+    if (isNaN(amount) || amount < 1 || amount > 100) return message.reply('❌ Usage: `-purge <1-100>` or `-purge @user <1-100>`');
     await message.delete().catch(() => {});
-    const fetched = await message.channel.messages.fetch({ limit: fm ? 100 : amount });
-    const toDelete = fm
-      ? [...fetched.filter(m => m.author.id === fm.id).values()].slice(0, amount)
-      : [...fetched.values()];
-    const deleted = await message.channel.bulkDelete(toDelete, true);
+    const fetched  = await message.channel.messages.fetch({ limit: fm ? 100 : amount });
+    const toDelete = fm ? [...fetched.filter(m => m.author.id === fm.id).values()].slice(0, amount) : [...fetched.values()];
+    const deleted  = await message.channel.bulkDelete(toDelete, true);
     const conf = await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription(`🗑️ Deleted **${deleted.size}** messages.`)] });
     setTimeout(() => conf.delete().catch(() => {}), 4000);
   }
@@ -912,33 +861,13 @@ client.on('messageCreate', async message => {
     const bypassRoles = bypassIds.map(id => message.guild.roles.cache.get(id)).filter(Boolean);
     if (cmd === 'lock') {
       await ch.permissionOverwrites.edit(everyone, { SendMessages: false }, { reason: `Locked by ${message.author.tag}` });
-      for (const role of bypassRoles) {
-        await ch.permissionOverwrites.edit(role, { SendMessages: true }, { reason: 'Lock whitelist bypass' }).catch(() => {});
-      }
+      for (const role of bypassRoles) await ch.permissionOverwrites.edit(role, { SendMessages: true }, { reason: 'Lock whitelist bypass' }).catch(() => {});
       const roleList = bypassRoles.length ? bypassRoles.map(r => `<@&${r.id}>`).join(' ') : 'None set — use `-lockwhitelist add @role`';
-      ch.send({
-        embeds: [new EmbedBuilder()
-          .setColor(0xff4444)
-          .setTitle('🔒 Channel Locked')
-          .setDescription(`This channel has been locked.\n\n**Roles that can still type:** ${roleList}`)
-          .setFooter({ text: `Locked by ${message.author.tag}` })
-          .setTimestamp()
-        ]
-      });
+      ch.send({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔒 Channel Locked').setDescription(`This channel has been locked.\n\n**Roles that can still type:** ${roleList}`).setFooter({ text: `Locked by ${message.author.tag}` }).setTimestamp()] });
     } else {
       await ch.permissionOverwrites.edit(everyone, { SendMessages: null }, { reason: `Unlocked by ${message.author.tag}` });
-      for (const role of bypassRoles) {
-        await ch.permissionOverwrites.edit(role, { SendMessages: null }, { reason: 'Lock removed' }).catch(() => {});
-      }
-      ch.send({
-        embeds: [new EmbedBuilder()
-          .setColor(0x00cc44)
-          .setTitle('🔓 Channel Unlocked')
-          .setDescription('Everyone can type here again.')
-          .setFooter({ text: `Unlocked by ${message.author.tag}` })
-          .setTimestamp()
-        ]
-      });
+      for (const role of bypassRoles) await ch.permissionOverwrites.edit(role, { SendMessages: null }, { reason: 'Lock removed' }).catch(() => {});
+      ch.send({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🔓 Channel Unlocked').setDescription('Everyone can type here again.').setFooter({ text: `Unlocked by ${message.author.tag}` }).setTimestamp()] });
     }
   }
 
@@ -949,13 +878,11 @@ client.on('messageCreate', async message => {
     const action = args[0]?.toLowerCase();
     const key    = `lockwhitelist.${message.guild.id}`;
     const list   = (await db.get(key)) ?? [];
-
     if (action === 'add') {
       const role = message.mentions.roles.first();
       if (!role) return message.reply('❌ Usage: `-lockwhitelist add @role`');
       if (list.includes(role.id)) return message.reply(`❌ ${role} is already whitelisted.`);
-      list.push(role.id);
-      await db.set(key, list);
+      list.push(role.id); await db.set(key, list);
       const all = list.map(id => { const r = message.guild.roles.cache.get(id); return r ? `<@&${r.id}>` : null; }).filter(Boolean).join(' ');
       return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('✅ Lock Whitelist').setDescription(`Added ${role}.\n\n**Current whitelist:** ${all}`)] });
     }
@@ -963,8 +890,8 @@ client.on('messageCreate', async message => {
       const role = message.mentions.roles.first();
       if (!role) return message.reply('❌ Usage: `-lockwhitelist remove @role`');
       if (!list.includes(role.id)) return message.reply(`❌ ${role} is not whitelisted.`);
-      await db.set(key, list.filter(id => id !== role.id));
       const remaining = list.filter(id => id !== role.id);
+      await db.set(key, remaining);
       const all = remaining.length ? remaining.map(id => { const r = message.guild.roles.cache.get(id); return r ? `<@&${r.id}>` : null; }).filter(Boolean).join(' ') : 'None';
       return message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('✅ Lock Whitelist').setDescription(`Removed ${role}.\n\n**Current whitelist:** ${all}`)] });
     }
@@ -1019,31 +946,21 @@ client.on('messageCreate', async message => {
     if (sub === 'test') {
       const cid = await db.get(`welcome.${gid}.channel`);
       if (!cid) return message.reply('❌ Set a channel first.');
-      // FIX: was `guild.channels` (undefined), now correctly `message.guild.channels`
       const chan = message.guild.channels.cache.get(cid) ?? await message.guild.channels.fetch(cid).catch(() => null);
       if (!chan) return message.reply('❌ Channel no longer exists.');
       let msg = await db.get(`welcome.${gid}.message`);
       if (msg) {
         msg = msg
-          .replace(/{user}/g,          `<@${message.author.id}>`)
-          .replace(/{username}/g,       message.author.username)
-          .replace(/{server}/g,         message.guild.name)
-          .replace(/{memberCount}/g,    message.guild.memberCount)
-          .replace(/{inviter}/g,        `<@${message.author.id}>`)
-          .replace(/{inviterTag}/g,     message.author.tag)
-          .replace(/{inviterCount}/g,   '1');
+          .replace(/{user}/g,        `<@${message.author.id}>`)
+          .replace(/{username}/g,     message.author.username)
+          .replace(/{server}/g,       message.guild.name)
+          .replace(/{memberCount}/g,  message.guild.memberCount)
+          .replace(/{inviter}/g,      `<@${message.author.id}>`)
+          .replace(/{inviterTag}/g,   message.author.tag)
+          .replace(/{inviterCount}/g, '1');
         await chan.send(msg);
       } else {
-        await chan.send({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(0x5865f2)
-              .setTitle(`Welcome to ${message.guild.name}!`)
-              .setDescription(`Hey <@${message.author.id}>, member **#${message.guild.memberCount}**!\n\nInvited by **${message.author.tag}** · **1** invite (test)`)
-              .setThumbnail(message.author.displayAvatarURL())
-              .setTimestamp(),
-          ],
-        });
+        await chan.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${message.guild.name}!`).setDescription(`Hey <@${message.author.id}>, member **#${message.guild.memberCount}**!\n\nInvited by **${message.author.tag}** · **1** invite (test)`).setThumbnail(message.author.displayAvatarURL()).setTimestamp()] });
       }
       return message.reply(`✅ Test sent to ${chan}.`);
     }
@@ -1085,10 +1002,10 @@ client.on('messageCreate', async message => {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
       return message.reply('❌ You need **Manage Server** permission.');
     const duration = parseDuration(args[0]);
-    if (!duration) return message.reply('❌ Usage: `-gcreate <duration> <winners> <prize>`\nAnything from `1s` to `7d` — e.g. `30s`, `5m`, `2h`, `3d`');
+    if (!duration) return message.reply('❌ Usage: `-gcreate <duration> <winners> <prize>`\nExamples: `30s` `5m` `2h` `3d`');
     const winnerCount = parseInt(args[1]);
     if (isNaN(winnerCount) || winnerCount < 1 || winnerCount > 20)
-      return message.reply('❌ Winners must be a number between 1 and 20.');
+      return message.reply('❌ Winners must be between 1 and 20.');
     const prize = args.slice(2).join(' ');
     if (!prize) return message.reply('❌ Please provide a prize name.');
 
@@ -1114,8 +1031,10 @@ client.on('messageCreate', async message => {
       hostId: message.author.id,
       active: true,
     });
+
+    // Auto-end scheduled here
     scheduleGiveaway(message.guild.id, gMsg.id, endsAt);
-    message.reply(`✅ Giveaway started! [Jump to it](${gMsg.url})`);
+    message.reply(`✅ Giveaway started! Ends <t:${Math.floor(endsAt / 1000)}:R> — [Jump to it](${gMsg.url})`);
   }
 
   // ── -gend ──────────────────────────────────────────────────────
@@ -1127,7 +1046,6 @@ client.on('messageCreate', async message => {
     const data = await db.get(`giveaways.${message.guild.id}.${mid}`);
     if (!data) return message.reply('❌ No giveaway found with that message ID.');
     if (!data.active) return message.reply('❌ That giveaway has already ended.');
-    clearTimeout(giveawayTimers.get(mid));
     await endGiveaway(message.guild.id, mid);
     message.reply('✅ Giveaway ended.');
   }
@@ -1147,17 +1065,23 @@ client.on('messageCreate', async message => {
 
   // ── -glist ─────────────────────────────────────────────────────
   else if (cmd === 'glist') {
-    const allKeys = await db.list(`giveaways.${message.guild.id}.`);
-    const active  = [];
-    for (const key of (allKeys?.keys ?? [])) {
-      const data = await db.get(key);
-      if (data?.active) {
-        const mid = key.split('.')[2];
-        active.push(`• **${data.prize}** — ${data.winnerCount} winner(s) — ends <t:${Math.floor(data.endsAt / 1000)}:R> — [ID: \`${mid}\`]`);
-      }
+    try {
+      const allEntries = await db.all();
+      const active = allEntries.filter(e =>
+        e.id.startsWith(`giveaways.${message.guild.id}.`) &&
+        e.id.split('.').length === 3 &&
+        e.value?.active
+      );
+      if (!active.length) return message.reply('❌ No active giveaways.');
+      const lines = active.map(e => {
+        const mid  = e.id.split('.')[2];
+        const d    = e.value;
+        return `• **${d.prize}** — ${d.winnerCount} winner(s) — ends <t:${Math.floor(d.endsAt / 1000)}:R> — ID: \`${mid}\``;
+      });
+      message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 Active Giveaways').setDescription(lines.join('\n')).setTimestamp()] });
+    } catch (e) {
+      message.reply('❌ Could not fetch giveaway list.');
     }
-    if (!active.length) return message.reply('❌ No active giveaways.');
-    message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 Active Giveaways').setDescription(active.join('\n')).setTimestamp()] });
   }
 
   // ── -antinuke ──────────────────────────────────────────────────
@@ -1171,8 +1095,7 @@ client.on('messageCreate', async message => {
       await db.set(`antinuke.${gid}.enabled`, true); clearCache(gid);
       await saveSnapshot(message.guild);
       snapCooldown.set(gid, Date.now());
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🛡️ Antinuke Enabled')
-        .setDescription('**Triggers at:** 2 deletions / bans / kicks in 4s\n**On trigger:** bans nuker + auto-restores channels\n**Snapshot:** taken now, refreshes every 30s\n\n⚠️ Give this bot the **highest role** so it can ban anyone.\n`-antinuke setlog #channel` — receive alerts\n`-antinuke whitelist add @user` — trust your admins')] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🛡️ Antinuke Enabled').setDescription('**Triggers at:** 2 deletions / bans / kicks in 4s\n**On trigger:** bans nuker + auto-restores channels\n**Snapshot:** taken now, refreshes every 30s\n\n⚠️ Give this bot the **highest role** so it can ban anyone.\n`-antinuke setlog #channel` — receive alerts\n`-antinuke whitelist add @user` — trust your admins')] });
     }
     if (sub === 'disable') {
       await db.set(`antinuke.${gid}.enabled`, false); clearCache(gid);
@@ -1211,13 +1134,12 @@ client.on('messageCreate', async message => {
       const s        = await getSettings(gid);
       const snapTime = await db.get(`snap.${gid}.time`);
       const snapData = (await db.get(`snap.${gid}`)) || [];
-      return message.reply({ embeds: [new EmbedBuilder().setColor(s.enabled ? 0x00cc44 : 0xff4444).setTitle('🛡️ Antinuke Status')
-        .addFields(
-          { name: 'Status',      value: s.enabled ? '✅ Enabled' : '❌ Disabled',                                              inline: true },
-          { name: 'Log Channel', value: s.logChannel ? `<#${s.logChannel}>` : 'Not set',                                      inline: true },
-          { name: 'Snapshot',    value: snapTime ? `${snapData.length} channels • <t:${Math.floor(snapTime / 1000)}:R>` : 'None', inline: true },
-          { name: 'Whitelist',   value: s.whitelist.length ? s.whitelist.map(id => `<@${id}>`).join(', ') : 'None' },
-        ).setTimestamp()] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(s.enabled ? 0x00cc44 : 0xff4444).setTitle('🛡️ Antinuke Status').addFields(
+        { name: 'Status',      value: s.enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
+        { name: 'Log Channel', value: s.logChannel ? `<#${s.logChannel}>` : 'Not set', inline: true },
+        { name: 'Snapshot',    value: snapTime ? `${snapData.length} channels • <t:${Math.floor(snapTime / 1000)}:R>` : 'None', inline: true },
+        { name: 'Whitelist',   value: s.whitelist.length ? s.whitelist.map(id => `<@${id}>`).join(', ') : 'None' },
+      ).setTimestamp()] });
     }
     if (sub === 'restore') {
       if (args[1]?.toLowerCase() === 'clear') {
