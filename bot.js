@@ -5,7 +5,7 @@ const {
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
 
-const db      = new QuickDB();
+const db = new QuickDB({ filePath: '/data/db.sqlite' });
 const client  = new Client({
   intents: [
     GatewayIntentBits.Guilds,
