@@ -5,7 +5,7 @@ const {
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
 
-const db = new QuickDB({ filePath: '/data/db.sqlite' });
+const db      = new QuickDB();
 const client  = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -1153,6 +1153,16 @@ client.on('messageCreate', async message => {
       return;
     }
     message.reply('❌ Subcommands: `enable` `disable` `setlog #ch` `snapshot` `whitelist add/remove @user` `status` `restore` `restore clear`');
+  }
+
+  // ── -say ──────────────────────────────────────────────────────
+  else if (cmd === 'say') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    const text = args.join(' ');
+    if (!text) return message.reply('❌ Usage: `-say <message>`');
+    await message.delete().catch(() => {});
+    await message.channel.send(text);
   }
 });
 
