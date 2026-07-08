@@ -2,6 +2,7 @@ const {
   Client, GatewayIntentBits, Partials,
   EmbedBuilder, PermissionFlagsBits,
   AuditLogEvent, ActivityType, Collection,
+  ActionRowBuilder, StringSelectMenuBuilder, ComponentType,
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
 const crypto = require('crypto');
@@ -288,6 +289,99 @@ const EIGHTBALL = [
   'Outlook not so good.', 'Very doubtful.', 'Absolutely not.',
 ];
 const POLL_EMOJIS = ['🇦', '🇧', '🇨', '🇩', '🇪', '🇫', '🇬', '🇭', '🇮', '🇯'];
+
+// ─────────────────────────────────────────────
+//  HELP MENU DATA
+// ─────────────────────────────────────────────
+const HELP = {
+  moderation: {
+    emoji: '🔨', label: 'Moderation', desc: 'Bans, kicks, mutes, warns, purge, lock',
+    commands: [
+      ['ban @user [reason]', 'Ban a member (DMs them the reason)'],
+      ['kick @user [reason]', 'Kick a member'],
+      ['mute @user <duration> [reason]', 'Mute for 1s–7d, e.g. `30m` `2h` `1d`'],
+      ['unmute @user', 'Remove a mute early'],
+      ['warn @user <reason>', 'Warn a member'],
+      ['warnings @user', 'View their last 10 warnings'],
+      ['warnings clear @user', 'Wipe all their warnings'],
+      ['purge <1-100>', 'Bulk delete recent messages'],
+      ['purge @user <1-100>', 'Bulk delete one person\'s messages'],
+      ['lock / unlock', 'Lock the channel (whitelist roles bypass)'],
+      ['lockwhitelist add/remove/list @role', 'Roles that can type in locked channels'],
+    ],
+  },
+  roles: {
+    emoji: '🎭', label: 'Roles', desc: 'Role management and autoroles',
+    commands: [
+      ['role @user <role name>', 'Toggle a role — run again to remove it'],
+      ['roleinfo <role>', 'Show role details and member count'],
+      ['autorole add/remove/list @role', 'Roles auto-given to new members'],
+    ],
+  },
+  invites: {
+    emoji: '📨', label: 'Invites', desc: 'Who invited who, leaderboards',
+    commands: [
+      ['invites [@user]', 'See someone\'s invite count'],
+      ['inviteleaderboard', 'Top 10 inviters in the server'],
+      ['invites reset @user', 'Reset a count (needs Manage Server)'],
+    ],
+  },
+  giveaways: {
+    emoji: '🎉', label: 'Giveaways', desc: 'Create, end, and reroll giveaways',
+    commands: [
+      ['gcreate <duration> <winners> <prize>', 'Start a giveaway, e.g. `-gcreate 1d 2 Nitro`'],
+      ['gend <messageId>', 'End a giveaway early'],
+      ['greroll <messageId>', 'Pick new winners for an ended giveaway'],
+      ['glist', 'List all active giveaways'],
+    ],
+  },
+  fun: {
+    emoji: '🎲', label: 'Fun', desc: '8ball, dice, ship, and more',
+    commands: [
+      ['8ball <question>', 'Ask the magic 8-ball'],
+      ['coinflip', 'Heads or tails'],
+      ['dice [sides]', 'Roll a die (default d6, up to d1000)'],
+      ['rps <rock|paper|scissors>', 'Play against the bot'],
+      ['choose a | b | c', 'Let the bot decide for you'],
+      ['ship @user [@user2]', 'Compatibility check 💘'],
+      ['mock <text>', 'sPoNgEbOb TeXt'],
+      ['reverse <text>', 'Flip text backwards'],
+    ],
+  },
+  utility: {
+    emoji: '🔧', label: 'Utility', desc: 'Info, polls, AFK, reminders, snipe',
+    commands: [
+      ['userinfo [@user]', 'Account age, join date, roles'],
+      ['serverinfo', 'Server stats at a glance'],
+      ['avatar [@user]', 'Full-size avatar'],
+      ['membercount', 'Current member count'],
+      ['ping', 'Bot latency'],
+      ['uptime', 'How long the bot\'s been online'],
+      ['poll <question>', 'Quick 👍👎 poll'],
+      ['poll question | opt1 | opt2', 'Multi-option poll (up to 10)'],
+      ['snipe', 'Show the last deleted message here'],
+      ['afk [reason]', 'Set AFK — auto-clears when you talk'],
+      ['remindme <duration> <text>', 'Get pinged later, e.g. `-remindme 2h food`'],
+      ['steal <emoji> [name]', 'Clone an emoji into this server'],
+      ['stealsticker [name]', 'Reply to a sticker to clone it here'],
+      ['say <message>', 'Make the bot say something (Manage Server)'],
+    ],
+  },
+  automod: {
+    emoji: '🧹', label: 'Automod & Logs', desc: 'Anti-spam, word filter, mod logs',
+    commands: [
+      ['automod enable/disable', 'Toggle automod (spam + mention-spam on by default)'],
+      ['automod status', 'See what\'s on and off'],
+      ['automod antispam on/off', '6 msgs in 5s → 5m mute'],
+      ['automod antilink on/off', 'Delete links and invites'],
+      ['automod anticaps on/off', 'Delete EXCESSIVE CAPS'],
+      ['automod antimention on/off', '5+ pings → 5m mute'],
+      ['automod filter add/remove/list <word>', 'Banned words (list is DMed)'],
+      ['modlog #channel', 'Log deletes, edits, joins, bans, automod'],
+      ['modlog disable', 'Turn off mod logging'],
+    ],
+  },
+};
 
 // ─────────────────────────────────────────────
 //  INVITE CACHE
@@ -998,19 +1092,55 @@ client.on('messageCreate', async message => {
     return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription('✅ Owner password set. Use `-cmdsowner` to access owner commands.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
   }
 
-  // ── -cmds ──────────────────────────────────────────────────────
+  // ── -cmds (interactive help menu) ──────────────────────────────
   if (cmd === 'cmds' || cmd === 'commands' || cmd === 'help') {
-    return message.reply({
-      embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📋 Commands').addFields(
-        { name: '🔨 Moderation', value: '`-ban @user [reason]`\n`-kick @user [reason]`\n`-mute @user <duration> [reason]`\n`-unmute @user`\n`-warn @user <reason>`\n`-warnings @user`\n`-warnings clear @user`\n`-purge <1-100>`\n`-purge @user <1-100>`\n`-lock`\n`-unlock`' },
-        { name: '🎭 Roles',      value: '`-role @user <role name>` — toggle (run again to remove)' },
-        { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset count (admin)' },
-        { name: '🎉 Giveaways',  value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nAny duration from `1s` to `7d`' },
-        { name: '🎲 Fun',        value: '`-8ball <question>` `-coinflip` `-dice [sides]`\n`-rps <rock|paper|scissors>` `-choose a | b | c`\n`-ship @a @b` `-mock <text>` `-reverse <text>`\n`-meme` `-joke`' },
-        { name: '🔧 Utility',    value: '`-userinfo [@user]` `-serverinfo` `-avatar [@user]`\n`-roleinfo <role>` `-membercount` `-ping` `-uptime`\n`-poll <question>` or `-poll q | opt1 | opt2`\n`-snipe` `-afk [reason]` `-remindme <duration> <text>`' },
-        { name: '🧹 Automod & Logs', value: '`-automod enable/disable/status`\n`-automod antispam/antilink/anticaps/antimention on/off`\n`-automod filter add/remove/list <word>`\n`-modlog #channel` `-modlog disable`' },
-      ).setFooter({ text: `Prefix: ${PREFIX}` })],
+    const total = Object.values(HELP).reduce((n, c) => n + c.commands.length, 0);
+
+    const homeEmbed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setAuthor({ name: `${client.user.username} • Help`, iconURL: client.user.displayAvatarURL() })
+      .setDescription(`**${total}** commands across **${Object.keys(HELP).length}** categories • Prefix: \`${PREFIX}\`\n\n📂 **Pick a category from the menu below** to see its commands with descriptions.`)
+      .addFields(Object.values(HELP).map(c => ({
+        name: `${c.emoji} ${c.label}`,
+        value: `${c.desc}\n*${c.commands.length} commands*`,
+        inline: true,
+      })))
+      .setFooter({ text: 'Menu is active for 2 minutes' })
+      .setTimestamp();
+
+    const buildMenu = (disabled = false) => new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId('help-menu')
+        .setPlaceholder(disabled ? 'Menu expired — run -cmds again' : '📂 Choose a category…')
+        .setDisabled(disabled)
+        .addOptions(
+          { label: 'Home', value: 'home', emoji: '🏠', description: 'Back to the overview' },
+          ...Object.entries(HELP).map(([id, c]) => ({
+            label: c.label, value: id, emoji: c.emoji, description: c.desc.slice(0, 100),
+          })),
+        )
+    );
+
+    const sent = await message.reply({ embeds: [homeEmbed], components: [buildMenu()] });
+    const collector = sent.createMessageComponentCollector({ componentType: ComponentType.StringSelect, time: 120000 });
+
+    collector.on('collect', async i => {
+      if (i.user.id !== message.author.id)
+        return i.reply({ content: `❌ This menu belongs to someone else — run \`${PREFIX}cmds\` yourself!`, ephemeral: true }).catch(() => {});
+      if (i.values[0] === 'home')
+        return i.update({ embeds: [homeEmbed], components: [buildMenu()] }).catch(() => {});
+      const c = HELP[i.values[0]];
+      const catEmbed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setAuthor({ name: `${c.emoji} ${c.label}`, iconURL: client.user.displayAvatarURL() })
+        .setDescription(c.commands.map(([usage, desc]) => `**\`${PREFIX}${usage}\`**\n> ${desc}`).join('\n'))
+        .setFooter({ text: `${c.commands.length} commands • Prefix: ${PREFIX}` })
+        .setTimestamp();
+      i.update({ embeds: [catEmbed], components: [buildMenu()] }).catch(() => {});
     });
+
+    collector.on('end', () => sent.edit({ components: [buildMenu(true)] }).catch(() => {}));
+    return;
   }
 
   // ── -invites ───────────────────────────────────────────────────
@@ -1531,26 +1661,6 @@ client.on('messageCreate', async message => {
     message.reply({ content: [...text].reverse().join('').slice(0, 2000), allowedMentions: { parse: [] } });
   }
 
-  // ── -meme ──────────────────────────────────────────────────────
-  else if (cmd === 'meme') {
-    try {
-      const res  = await fetch('https://meme-api.com/gimme');
-      const data = await res.json();
-      if (!data?.url || data.nsfw) return message.reply('❌ Couldn\'t find a meme, try again.');
-      message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(data.title?.slice(0, 256) || 'Meme').setImage(data.url).setFooter({ text: `👍 ${data.ups ?? 0} • r/${data.subreddit ?? '?'}` })] });
-    } catch { message.reply('❌ Meme API is down, try again later.'); }
-  }
-
-  // ── -joke ──────────────────────────────────────────────────────
-  else if (cmd === 'joke') {
-    try {
-      const res  = await fetch('https://icanhazdadjoke.com/', { headers: { Accept: 'application/json' } });
-      const data = await res.json();
-      if (!data?.joke) return message.reply('❌ No joke found, try again.');
-      message.reply(`😄 ${data.joke}`);
-    } catch { message.reply('❌ Joke API is down, try again later.'); }
-  }
-
   // ═══════════════════════════════════════════════════════════════
   //  UTILITY COMMANDS
   // ═══════════════════════════════════════════════════════════════
@@ -1648,6 +1758,64 @@ client.on('messageCreate', async message => {
     const s = snipes.get(message.channel.id);
     if (!s) return message.reply('❌ Nothing to snipe in this channel.');
     message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setAuthor({ name: s.authorTag, iconURL: s.authorAvatar }).setDescription(s.content.slice(0, 2048)).setFooter({ text: 'Deleted' }).setTimestamp(s.time)] });
+  }
+
+  // ── -steal ─────────────────────────────────────────────────────
+  else if (cmd === 'steal') {
+    const stealPerm = PermissionFlagsBits.ManageGuildExpressions ?? PermissionFlagsBits.ManageEmojisAndStickers;
+    if (!message.member.permissions.has(stealPerm))
+      return message.reply('❌ You need **Manage Expressions** permission.');
+    const match = message.content.match(/<(a?):(\w+):(\d+)>/);
+    if (!match) return message.reply('❌ Usage: `-steal <emoji> [new name]` — paste a custom emoji from another server.');
+    const [, animated, defaultName, id] = match;
+    const customName = args.find(a => !a.includes(':') && /^\w{2,32}$/.test(a));
+    const name = customName || defaultName;
+    const url = `https://cdn.discordapp.com/emojis/${id}.${animated ? 'gif' : 'png'}?size=128&quality=lossless`;
+    try {
+      const emoji = await message.guild.emojis.create({ attachment: url, name });
+      message.reply(`✅ Stolen! ${emoji} → \`:${emoji.name}:\``);
+    } catch (e) {
+      const why = /maximum/i.test(e.message) ? 'this server is out of emoji slots.'
+        : /permission/i.test(e.message) ? 'I\'m missing **Manage Expressions** permission.'
+        : e.message.slice(0, 100);
+      message.reply(`❌ Couldn't add the emoji — ${why}`);
+    }
+  }
+
+  // ── -stealsticker ──────────────────────────────────────────────
+  else if (cmd === 'stealsticker') {
+    const stealPerm = PermissionFlagsBits.ManageGuildExpressions ?? PermissionFlagsBits.ManageEmojisAndStickers;
+    if (!message.member.permissions.has(stealPerm))
+      return message.reply('❌ You need **Manage Expressions** permission.');
+
+    // Grab the sticker from this message, or from the message being replied to
+    let sticker = message.stickers.first();
+    if (!sticker && message.reference?.messageId) {
+      const ref = await message.channel.messages.fetch(message.reference.messageId).catch(() => null);
+      sticker = ref?.stickers.first();
+    }
+    if (!sticker) return message.reply('❌ Usage: **reply to a message that has a sticker** with `-stealsticker [new name]`.');
+
+    // Lottie stickers (Discord's default sticker packs) can't be uploaded to normal servers
+    if (sticker.format === 3)
+      return message.reply('❌ That\'s one of Discord\'s built-in stickers (Lottie format) — those can\'t be copied to servers. Only custom server stickers work.');
+
+    const customName = args.find(a => /^[\w -]{2,30}$/.test(a));
+    const name = (customName || sticker.name).slice(0, 30);
+    try {
+      const created = await message.guild.stickers.create({
+        file: sticker.url,
+        name,
+        tags: sticker.tags || 'sticker',
+        reason: `Stolen by ${message.author.tag}`,
+      });
+      message.reply(`✅ Sticker stolen! Added **${created.name}** to this server.`);
+    } catch (e) {
+      const why = /maximum|asset exceeds/i.test(e.message) ? 'this server is out of sticker slots (or the file is too big).'
+        : /permission/i.test(e.message) ? 'I\'m missing **Manage Expressions** permission.'
+        : e.message.slice(0, 100);
+      message.reply(`❌ Couldn't add the sticker — ${why}`);
+    }
   }
 
   // ── -afk ───────────────────────────────────────────────────────
