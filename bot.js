@@ -4,6 +4,7 @@ const {
   AuditLogEvent, ActivityType, Collection,
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
+const crypto = require('crypto');
 
 const db      = new QuickDB();
 const client  = new Client({
@@ -19,46 +20,87 @@ const client  = new Client({
   partials: [Partials.GuildMember, Partials.Message, Partials.Reaction],
 });
 
+// ─────────────────────────────────────────────
+//  SMALL HELPERS
+// ─────────────────────────────────────────────
+const hashPw = pw => crypto.createHash('sha256').update(pw).digest('hex');
+
+// Safe placeholder replacement — plain .replace(str) breaks if a username
+// contains "$&" or "$'", so always use a function replacement.
+function fillPlaceholders(template, map) {
+  let out = template;
+  for (const [key, value] of Object.entries(map)) {
+    out = out.replace(new RegExp(`\\{${key}\\}`, 'g'), () => String(value));
+  }
+  return out;
+}
+
+// Resolve a member from a mention or a raw ID arg.
+// IMPORTANT: never call guild.members.fetch(undefined) — that fetches the
+// ENTIRE member list and returns a truthy Collection, breaking the !t check.
+async function resolveMember(message, arg) {
+  const mentioned = message.mentions.members.first();
+  if (mentioned) return mentioned;
+  if (!arg || !/^\d{15,21}$/.test(arg)) return null;
+  return message.guild.members.fetch(arg).catch(() => null);
+}
+
+async function resolveUser(message, arg) {
+  const mentioned = message.mentions.users.first();
+  if (mentioned) return mentioned;
+  if (!arg || !/^\d{15,21}$/.test(arg)) return null;
+  return client.users.fetch(arg).catch(() => null);
+}
 
 // ─────────────────────────────────────────────
-//  GIVEAWAY HELPERS
+//  GIVEAWAY / MUTE TIMERS
 // ─────────────────────────────────────────────
 const giveawayTimers = new Map();
 const muteTimers     = new Map();
 
 // ─────────────────────────────────────────────
 //  MUTE ROLE HELPER
+//  The role is stored by ID (not looked up by name) so a renamed role or a
+//  fake second "Muted" role can't break or hijack the mute system.
 // ─────────────────────────────────────────────
-async function getMuteRole(guild) {
-  let role = guild.roles.cache.find(r => r.name === 'Muted');
-  if (!role) {
-    role = await guild.roles.create({
-      name: 'Muted',
-      color: 0x808080,
-      permissions: [],
-      reason: 'Auto-created for -mute command',
-    });
-    for (const ch of guild.channels.cache.values()) {
-      if (ch.isTextBased() || ch.type === 2) {
-        await ch.permissionOverwrites.edit(role, {
-          SendMessages:           false,
-          SendMessagesInThreads:  false,
-          AddReactions:           false,
-          Speak:                  false,
-        }).catch(() => {});
-      }
-    }
-    console.log(`[mute] Created Muted role in ${guild.name}`);
+async function getMuteRole(guild, createIfMissing = true) {
+  const storedId = await db.get(`muterole.${guild.id}`);
+  if (storedId) {
+    const role = guild.roles.cache.get(storedId) ?? await guild.roles.fetch(storedId).catch(() => null);
+    if (role) return role;
+    await db.delete(`muterole.${guild.id}`); // role was deleted — fall through
   }
+  if (!createIfMissing) return null;
+
+  const role = await guild.roles.create({
+    name: 'Muted',
+    color: 0x808080,
+    permissions: [],
+    reason: 'Auto-created for -mute command',
+  });
+  await db.set(`muterole.${guild.id}`, role.id);
+
+  for (const ch of guild.channels.cache.values()) {
+    if (ch.isTextBased() || ch.type === 2) {
+      await ch.permissionOverwrites.edit(role, {
+        SendMessages:           false,
+        SendMessagesInThreads:  false,
+        AddReactions:           false,
+        Speak:                  false,
+      }).catch(() => {});
+    }
+  }
+  console.log(`[mute] Created Muted role in ${guild.name}`);
   return role;
 }
 
 async function unmuteUser(guild, userId, reason) {
-  const muteRole = guild.roles.cache.find(r => r.name === 'Muted');
-  if (!muteRole) return;
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (member?.roles.cache.has(muteRole.id)) {
-    await member.roles.remove(muteRole, reason).catch(() => {});
+  const muteRole = await getMuteRole(guild, false);
+  if (muteRole) {
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member?.roles.cache.has(muteRole.id)) {
+      await member.roles.remove(muteRole, reason).catch(() => {});
+    }
   }
   await db.delete(`mutes.${guild.id}.${userId}`);
   muteTimers.delete(`${guild.id}:${userId}`);
@@ -82,7 +124,7 @@ function formatDuration(ms) {
 }
 
 // ─────────────────────────────────────────────
-//  GIVEAWAY END  (fixed)
+//  GIVEAWAY END
 // ─────────────────────────────────────────────
 async function endGiveaway(guildId, messageId, reroll = false) {
   const data = await db.get(`giveaways.${guildId}.${messageId}`);
@@ -106,7 +148,6 @@ async function endGiveaway(guildId, messageId, reroll = false) {
   const msg = await channel.messages.fetch(messageId).catch(() => null);
   if (!msg) return console.error(`[giveaway] Message not found: ${messageId}`);
 
-  // Use find() instead of get() — more reliable for emoji matching
   const reaction = msg.reactions.cache.find(r => r.emoji.name === '🎉');
   let users = new Collection();
   if (reaction) {
@@ -114,7 +155,7 @@ async function endGiveaway(guildId, messageId, reroll = false) {
     if (fetched) users = fetched.filter(u => !u.bot);
   }
 
-  // Mark inactive and save AFTER fetching users so a silent error doesn't kill the giveaway
+  // Mark inactive AFTER fetching users so a silent error doesn't kill the giveaway
   if (!reroll) {
     await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false });
   }
@@ -135,8 +176,13 @@ async function endGiveaway(guildId, messageId, reroll = false) {
   }
 
   const mentions = winners.map(w => `<@${w.id}>`).join(', ');
+  // allowedMentions: only ping the actual winners, never roles/everyone
   await msg.edit({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 GIVEAWAY ENDED').setDescription(`**${data.prize}**\n\n🏆 Winner${count > 1 ? 's' : ''}: ${mentions}`).setFooter({ text: `${count} winner(s) • Ended` }).setTimestamp()] }).catch(() => {});
-  await channel.send({ content: mentions, embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🎉 Congrats ${mentions}! You won **${data.prize}**!\n\n*Hosted by <@${data.hostId}>*`)] }).catch(() => {});
+  await channel.send({
+    content: mentions,
+    embeds: [new EmbedBuilder().setColor(0x5865f2).setDescription(`🎉 Congrats ${mentions}! You won **${data.prize}**!\n\n*Hosted by <@${data.hostId}>*`)],
+    allowedMentions: { users: winners.map(w => w.id) },
+  }).catch(() => {});
 
   if (!reroll) {
     await db.set(`giveaways.${guildId}.${messageId}`, { ...data, active: false, lastWinners: winners.map(w => w.id) });
@@ -146,7 +192,6 @@ async function endGiveaway(guildId, messageId, reroll = false) {
 }
 
 function scheduleGiveaway(guildId, messageId, endsAt) {
-  // Clear any existing timer for this giveaway before setting a new one
   if (giveawayTimers.has(messageId)) clearTimeout(giveawayTimers.get(messageId));
   const delay = Math.max(endsAt - Date.now(), 0);
   const timer = setTimeout(() => endGiveaway(guildId, messageId), delay);
@@ -158,6 +203,91 @@ const PREFIX       = '-';
 const restoring    = new Set();
 const snapCooldown = new Map();
 const pendingPassword = new Map();
+
+// ─────────────────────────────────────────────
+//  AUTOMOD SETTINGS + CACHE
+// ─────────────────────────────────────────────
+const amCache = new Map();
+async function getAutomod(gid) {
+  if (amCache.has(gid)) return amCache.get(gid);
+  const s = (await db.get(`automod.${gid}`)) || {};
+  const cfg = {
+    enabled:     !!s.enabled,
+    antispam:    s.antispam    !== false, // default on
+    antilink:    !!s.antilink,
+    anticaps:    !!s.anticaps,
+    antimention: s.antimention !== false, // default on
+    filter:      s.filter || [],
+  };
+  amCache.set(gid, cfg);
+  return cfg;
+}
+function clearAmCache(gid) { amCache.delete(gid); }
+
+const spamMap = new Map(); // "gid:uid" -> [timestamps]
+
+// Temporary mute used by automod (reuses the same mute system as -mute)
+async function tempMute(guild, member, ms, reason) {
+  const muteRole = await getMuteRole(guild).catch(() => null);
+  if (!muteRole) return false;
+  if (guild.members.me.roles.highest.position <= muteRole.position) return false;
+  if (member.roles.cache.has(muteRole.id)) return true;
+  const ok = await member.roles.add(muteRole, reason).then(() => true).catch(() => false);
+  if (!ok) return false;
+  const endsAt = Date.now() + ms;
+  await db.set(`mutes.${guild.id}.${member.id}`, { endsAt, reason, moderatorId: client.user.id });
+  clearTimeout(muteTimers.get(`${guild.id}:${member.id}`));
+  muteTimers.set(`${guild.id}:${member.id}`, setTimeout(() => unmuteUser(guild, member.id, 'Mute expired'), ms));
+  return true;
+}
+
+// ─────────────────────────────────────────────
+//  MOD LOG
+// ─────────────────────────────────────────────
+async function modLog(guild, embed) {
+  const cid = await db.get(`modlog.${guild.id}`);
+  if (!cid) return;
+  const ch = guild.channels.cache.get(cid) ?? await guild.channels.fetch(cid).catch(() => null);
+  if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+}
+
+// ─────────────────────────────────────────────
+//  SNIPE (last deleted message per channel)
+// ─────────────────────────────────────────────
+const snipes = new Map(); // channelId -> { content, authorTag, authorAvatar, time }
+
+// ─────────────────────────────────────────────
+//  REMINDERS
+// ─────────────────────────────────────────────
+const reminderTimers = new Map();
+function scheduleReminder(id, rem) {
+  clearTimeout(reminderTimers.get(id));
+  const delay = Math.max(rem.endsAt - Date.now(), 0);
+  reminderTimers.set(id, setTimeout(async () => {
+    reminderTimers.delete(id);
+    await db.delete(`reminders.${id}`).catch(() => {});
+    const ch = client.channels.cache.get(rem.channelId) ?? await client.channels.fetch(rem.channelId).catch(() => null);
+    if (!ch) return;
+    ch.send({
+      content: `<@${rem.userId}>`,
+      embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('⏰ Reminder').setDescription(rem.text).setTimestamp()],
+      allowedMentions: { users: [rem.userId] },
+    }).catch(() => {});
+  }, delay));
+}
+
+// ─────────────────────────────────────────────
+//  FUN DATA
+// ─────────────────────────────────────────────
+const EIGHTBALL = [
+  'It is certain.', 'Without a doubt.', 'Yes, definitely.', 'You may rely on it.',
+  'As I see it, yes.', 'Most likely.', 'Outlook good.', 'Yes.', 'Signs point to yes.',
+  'Reply hazy, try again.', 'Ask again later.', 'Better not tell you now.',
+  'Cannot predict now.', 'Concentrate and ask again.',
+  "Don't count on it.", 'My reply is no.', 'My sources say no.',
+  'Outlook not so good.', 'Very doubtful.', 'Absolutely not.',
+];
+const POLL_EMOJIS = ['🇦', '🇧', '🇨', '🇩', '🇪', '🇫', '🇬', '🇭', '🇮', '🇯'];
 
 // ─────────────────────────────────────────────
 //  INVITE CACHE
@@ -197,9 +327,10 @@ function clearCache(gid) { settCache.delete(gid); }
 
 // ─────────────────────────────────────────────
 //  IN-MEMORY COUNTERS
+//  limit 3 in 4s — 2 was aggressive enough to ban a mod doing normal cleanup
 // ─────────────────────────────────────────────
 const counters = { ch: new Map(), role: new Map(), ban: new Map(), kick: new Map() };
-function crossed(map, gid, window = 4000, limit = 2) {
+function crossed(map, gid, window = 4000, limit = 3) {
   if (!map.has(gid)) map.set(gid, []);
   const now   = Date.now();
   const times = map.get(gid).filter(t => now - t < window);
@@ -220,13 +351,18 @@ function prefetch(guild, type) {
     setTimeout(() => prefetchMap.delete(k), 5000);
   }
 }
+// Only trust audit entries created in the last 5s — a stale entry means we'd
+// blame (and ban) whoever happened to do that action last, minutes ago.
 async function getExec(guild, type) {
   const k = `${guild.id}:${type}`;
   const [pre, fresh] = await Promise.all([
     prefetchMap.get(k) || Promise.resolve(null),
     guild.fetchAuditLogs({ type, limit: 1 }).catch(() => null),
   ]);
-  return (fresh?.entries.first() || pre?.entries.first())?.executor || null;
+  const entry = fresh?.entries.first() || pre?.entries.first();
+  if (!entry) return null;
+  if (Date.now() - entry.createdTimestamp > 5000) return null;
+  return entry.executor;
 }
 
 // ─────────────────────────────────────────────
@@ -385,25 +521,23 @@ client.once('ready', async () => {
   }
 
   // ── Reschedule active giveaways on restart ──────────────────
-  // Uses db.all() which works across all quick.db v9 versions
+  // quick.db stores dot-notation keys as ONE nested object under the first
+  // segment, so db.all() has an entry with id "giveaways" — filtering ids by
+  // startsWith('giveaways.') matches nothing. Read the nested object instead.
   try {
-    const allEntries = await db.all();
-    const giveawayEntries = allEntries.filter(e =>
-      e.id.startsWith('giveaways.') && e.id.split('.').length === 3
-    );
+    const allGiveaways = (await db.get('giveaways')) || {};
     let rescheduled = 0;
-    for (const entry of giveawayEntries) {
-      const data = entry.value;
-      if (!data?.active) continue;
-      const parts     = entry.id.split('.');
-      const guildId   = parts[1];
-      const messageId = parts[2];
-      if (Date.now() >= data.endsAt) {
-        // Already expired while bot was offline — end immediately
-        endGiveaway(guildId, messageId);
-      } else {
-        scheduleGiveaway(guildId, messageId, data.endsAt);
-        rescheduled++;
+    for (const [guildId, msgs] of Object.entries(allGiveaways)) {
+      if (!msgs || typeof msgs !== 'object') continue;
+      for (const [messageId, data] of Object.entries(msgs)) {
+        if (!data?.active) continue;
+        if (Date.now() >= data.endsAt) {
+          // Already expired while bot was offline — end immediately
+          endGiveaway(guildId, messageId);
+        } else {
+          scheduleGiveaway(guildId, messageId, data.endsAt);
+          rescheduled++;
+        }
       }
     }
     if (rescheduled > 0) console.log(`[giveaway] Rescheduled ${rescheduled} active giveaway(s)`);
@@ -413,27 +547,34 @@ client.once('ready', async () => {
 
   // ── Reschedule active mutes on restart ──────────────────────
   try {
-    const allEntries = await db.all();
-    const muteEntries = allEntries.filter(e =>
-      e.id.startsWith('mutes.') && e.id.split('.').length === 3
-    );
-    for (const entry of muteEntries) {
-      const data = entry.value;
-      if (!data) continue;
-      const parts   = entry.id.split('.');
-      const guildId = parts[1], userId = parts[2];
-      const guild   = client.guilds.cache.get(guildId);
+    const allMutes = (await db.get('mutes')) || {};
+    for (const [guildId, users] of Object.entries(allMutes)) {
+      if (!users || typeof users !== 'object') continue;
+      const guild = client.guilds.cache.get(guildId);
       if (!guild) continue;
-      const remaining = data.endsAt - Date.now();
-      if (remaining <= 0) {
-        await unmuteUser(guild, userId, 'Mute expired');
-      } else {
-        const timer = setTimeout(() => unmuteUser(guild, userId, 'Mute expired'), remaining);
-        muteTimers.set(`${guildId}:${userId}`, timer);
+      for (const [userId, data] of Object.entries(users)) {
+        if (!data) continue;
+        const remaining = data.endsAt - Date.now();
+        if (remaining <= 0) {
+          await unmuteUser(guild, userId, 'Mute expired');
+        } else {
+          const timer = setTimeout(() => unmuteUser(guild, userId, 'Mute expired'), remaining);
+          muteTimers.set(`${guildId}:${userId}`, timer);
+        }
       }
     }
   } catch (e) {
     console.error('[mute] Failed to reschedule mutes on startup:', e.message);
+  }
+
+  // ── Reschedule reminders on restart ─────────────────────────
+  try {
+    const allReminders = (await db.get('reminders')) || {};
+    for (const [id, rem] of Object.entries(allReminders)) {
+      if (rem?.endsAt) scheduleReminder(id, rem);
+    }
+  } catch (e) {
+    console.error('[remind] Failed to reschedule reminders:', e.message);
   }
 
   setInterval(async () => {
@@ -453,7 +594,7 @@ client.on('guildCreate', guild => cacheInvites(guild));
 
 client.on('channelCreate', async channel => {
   if (!channel.guild) return;
-  const muteRole = channel.guild.roles.cache.find(r => r.name === 'Muted');
+  const muteRole = await getMuteRole(channel.guild, false);
   if (!muteRole) return;
   if (channel.isTextBased() || channel.type === 2) {
     await channel.permissionOverwrites.edit(muteRole, {
@@ -475,6 +616,68 @@ client.on('inviteCreate', invite => {
 client.on('inviteDelete', invite => {
   if (!invite.guild) return;
   inviteCache.get(invite.guild.id)?.delete(invite.code);
+});
+
+// ─────────────────────────────────────────────
+//  LOGGING EVENTS  (modlog + snipe)
+// ─────────────────────────────────────────────
+client.on('messageDelete', async message => {
+  if (!message.guild || message.partial || message.author?.bot) return;
+  const content = message.content || '*[no text content]*';
+  snipes.set(message.channel.id, {
+    content,
+    authorTag:    message.author.tag,
+    authorAvatar: message.author.displayAvatarURL(),
+    time:         Date.now(),
+  });
+  modLog(message.guild, new EmbedBuilder()
+    .setColor(0xff4444).setTitle('🗑️ Message Deleted')
+    .addFields(
+      { name: 'Author',  value: `${message.author.tag} (<@${message.author.id}>)`, inline: true },
+      { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+      { name: 'Content', value: content.slice(0, 1024) },
+    ).setTimestamp());
+});
+
+client.on('messageUpdate', async (oldMsg, newMsg) => {
+  if (!newMsg.guild || newMsg.partial || oldMsg.partial || newMsg.author?.bot) return;
+  if (oldMsg.content === newMsg.content) return;
+  modLog(newMsg.guild, new EmbedBuilder()
+    .setColor(0xffcc00).setTitle('✏️ Message Edited')
+    .addFields(
+      { name: 'Author',  value: `${newMsg.author.tag} (<@${newMsg.author.id}>)`, inline: true },
+      { name: 'Channel', value: `<#${newMsg.channel.id}> — [Jump](${newMsg.url})`, inline: true },
+      { name: 'Before',  value: (oldMsg.content || '*empty*').slice(0, 1024) },
+      { name: 'After',   value: (newMsg.content || '*empty*').slice(0, 1024) },
+    ).setTimestamp());
+});
+
+client.on('guildMemberAdd', member => {
+  modLog(member.guild, new EmbedBuilder()
+    .setColor(0x00cc44).setTitle('📥 Member Joined')
+    .setDescription(`${member.user.tag} (<@${member.id}>)\nAccount created <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`)
+    .setThumbnail(member.user.displayAvatarURL()).setTimestamp());
+});
+
+client.on('guildMemberRemove', member => {
+  modLog(member.guild, new EmbedBuilder()
+    .setColor(0xff8800).setTitle('📤 Member Left')
+    .setDescription(`${member.user?.tag ?? member.id} (<@${member.id}>)`)
+    .setTimestamp());
+});
+
+client.on('guildBanAdd', ban => {
+  modLog(ban.guild, new EmbedBuilder()
+    .setColor(0xff4444).setTitle('🔨 Member Banned')
+    .setDescription(`${ban.user.tag} (<@${ban.user.id}>)`)
+    .setTimestamp());
+});
+
+client.on('guildBanRemove', ban => {
+  modLog(ban.guild, new EmbedBuilder()
+    .setColor(0x00cc44).setTitle('🔓 Member Unbanned')
+    .setDescription(`${ban.user.tag} (<@${ban.user.id}>)`)
+    .setTimestamp());
 });
 
 // ─────────────────────────────────────────────
@@ -531,17 +734,21 @@ client.on('guildMemberAdd', async member => {
       if (ch) {
         const perms = ch.permissionsFor(guild.members.me);
         if (perms?.has(PermissionFlagsBits.ViewChannel) && perms?.has(PermissionFlagsBits.SendMessages)) {
-          let msg = await db.get(`welcome.${guild.id}.message`);
-          if (msg) {
-            msg = msg
-              .replace(/{user}/g,        `<@${user.id}>`)
-              .replace(/{username}/g,     user.username)
-              .replace(/{server}/g,       guild.name)
-              .replace(/{memberCount}/g,  guild.memberCount)
-              .replace(/{inviter}/g,      inviter ? `<@${inviter.id}>` : 'Unknown')
-              .replace(/{inviterTag}/g,   inviter?.tag ?? 'Unknown')
-              .replace(/{inviterCount}/g, String(inviterCount));
-            await ch.send(msg);
+          const template = await db.get(`welcome.${guild.id}.message`);
+          if (template) {
+            const msg = fillPlaceholders(template, {
+              user:         `<@${user.id}>`,
+              username:     user.username,
+              server:       guild.name,
+              memberCount:  guild.memberCount,
+              inviter:      inviter ? `<@${inviter.id}>` : 'Unknown',
+              inviterTag:   inviter?.tag ?? 'Unknown',
+              inviterCount: inviterCount,
+            });
+            // only allow pinging the new member + inviter, never everyone/roles
+            const allowedUsers = [user.id];
+            if (inviter) allowedUsers.push(inviter.id);
+            await ch.send({ content: msg, allowedMentions: { users: allowedUsers } });
           } else {
             const desc = inviter
               ? `Hey <@${user.id}>, you are member **#${guild.memberCount}**!\n\nInvited by **${inviter.tag}** · **${inviterCount}** invite${inviterCount !== 1 ? 's' : ''}`
@@ -631,6 +838,105 @@ client.on('guildMemberRemove', async member => {
 client.on('messageCreate', async message => {
   if (message.author.bot || !message.guild) return;
 
+  // ── AUTOMOD ────────────────────────────────────────────────────
+  // Mods (Manage Messages), the owner, and antinuke-whitelisted users are exempt.
+  try {
+    const am = await getAutomod(message.guild.id);
+    const exempt = message.author.id === message.guild.ownerId
+      || message.member?.permissions.has(PermissionFlagsBits.ManageMessages);
+    if (am.enabled && !exempt) {
+      const content = message.content ?? '';
+      const lower   = content.toLowerCase();
+
+      // word filter
+      if (am.filter.length && am.filter.some(w => lower.includes(w))) {
+        await message.delete().catch(() => {});
+        message.channel.send(`⚠️ <@${message.author.id}>, that word isn't allowed here.`)
+          .then(m => setTimeout(() => m.delete().catch(() => {}), 4000)).catch(() => {});
+        modLog(message.guild, new EmbedBuilder().setColor(0xff4444).setTitle('🧹 Automod — Filtered Word')
+          .setDescription(`**${message.author.tag}** in <#${message.channel.id}>:\n${content.slice(0, 500)}`).setTimestamp());
+        return;
+      }
+
+      // anti-link (discord invites + urls)
+      if (am.antilink && /(discord\.(gg|com\/invite)\/|https?:\/\/)/i.test(content)) {
+        await message.delete().catch(() => {});
+        message.channel.send(`⚠️ <@${message.author.id}>, links aren't allowed here.`)
+          .then(m => setTimeout(() => m.delete().catch(() => {}), 4000)).catch(() => {});
+        modLog(message.guild, new EmbedBuilder().setColor(0xff4444).setTitle('🧹 Automod — Link Removed')
+          .setDescription(`**${message.author.tag}** in <#${message.channel.id}>:\n${content.slice(0, 500)}`).setTimestamp());
+        return;
+      }
+
+      // anti-caps (>70% caps in messages longer than 8 letters)
+      if (am.anticaps) {
+        const letters = content.replace(/[^A-Za-z]/g, '');
+        if (letters.length > 8 && letters.replace(/[^A-Z]/g, '').length / letters.length > 0.7) {
+          await message.delete().catch(() => {});
+          message.channel.send(`⚠️ <@${message.author.id}>, please don't use excessive caps.`)
+            .then(m => setTimeout(() => m.delete().catch(() => {}), 4000)).catch(() => {});
+          return;
+        }
+      }
+
+      // anti mention-spam (5+ user mentions in one message → 5m mute)
+      if (am.antimention && message.mentions.users.size >= 5) {
+        await message.delete().catch(() => {});
+        const muted = await tempMute(message.guild, message.member, 5 * 60000, 'Automod: mention spam');
+        message.channel.send(`🔇 <@${message.author.id}> ${muted ? 'was muted for 5m' : 'was warned'} — mention spam.`)
+          .then(m => setTimeout(() => m.delete().catch(() => {}), 6000)).catch(() => {});
+        modLog(message.guild, new EmbedBuilder().setColor(0xff4444).setTitle('🧹 Automod — Mention Spam')
+          .setDescription(`**${message.author.tag}** mentioned ${message.mentions.users.size} users in <#${message.channel.id}>.`).setTimestamp());
+        return;
+      }
+
+      // anti-spam (6 messages within 5s → delete recent + 5m mute)
+      if (am.antispam) {
+        const key = `${message.guild.id}:${message.author.id}`;
+        const now = Date.now();
+        const times = (spamMap.get(key) || []).filter(t => now - t < 5000);
+        times.push(now);
+        spamMap.set(key, times);
+        if (times.length >= 6) {
+          spamMap.delete(key);
+          const muted = await tempMute(message.guild, message.member, 5 * 60000, 'Automod: spam');
+          const recent = await message.channel.messages.fetch({ limit: 30 }).catch(() => null);
+          if (recent) {
+            const theirs = [...recent.filter(m => m.author.id === message.author.id).values()].slice(0, 10);
+            await message.channel.bulkDelete(theirs, true).catch(() => {});
+          }
+          message.channel.send(`🔇 <@${message.author.id}> ${muted ? 'was muted for 5m' : 'was warned'} — spamming.`)
+            .then(m => setTimeout(() => m.delete().catch(() => {}), 6000)).catch(() => {});
+          modLog(message.guild, new EmbedBuilder().setColor(0xff4444).setTitle('🧹 Automod — Spam')
+            .setDescription(`**${message.author.tag}** was spamming in <#${message.channel.id}>.`).setTimestamp());
+          return;
+        }
+      }
+    }
+  } catch (e) { console.error('[automod]', e.message); }
+
+  // ── AFK ────────────────────────────────────────────────────────
+  try {
+    const selfAfk = await db.get(`afk.${message.guild.id}.${message.author.id}`);
+    if (selfAfk && !message.content.toLowerCase().startsWith(`${PREFIX}afk`)) {
+      await db.delete(`afk.${message.guild.id}.${message.author.id}`);
+      message.reply(`👋 Welcome back! I removed your AFK.`)
+        .then(m => setTimeout(() => m.delete().catch(() => {}), 5000)).catch(() => {});
+    }
+    if (message.mentions.users.size > 0 && message.mentions.users.size < 5) {
+      const notes = [];
+      for (const [, u] of message.mentions.users) {
+        if (u.id === message.author.id) continue;
+        const a = await db.get(`afk.${message.guild.id}.${u.id}`);
+        if (a) notes.push(`💤 **${u.username}** is AFK: ${a.reason} — <t:${Math.floor(a.since / 1000)}:R>`);
+      }
+      if (notes.length) {
+        message.reply({ content: notes.join('\n'), allowedMentions: { parse: [] } })
+          .then(m => setTimeout(() => m.delete().catch(() => {}), 8000)).catch(() => {});
+      }
+    }
+  } catch {}
+
   // ── Password intercept ─────────────────────────────────────────
   const pending = pendingPassword.get(message.author.id);
   if (pending && pending.guildId === message.guild.id) {
@@ -638,13 +944,17 @@ client.on('messageCreate', async message => {
       pendingPassword.delete(message.author.id);
     } else {
       const attempt = message.content.trim();
-      await message.delete().catch(() => {});
-      const storedPw = await db.get(`ownerpassword.${message.guild.id}`);
+      const deleted = await message.delete().then(() => true).catch(() => false);
+      const storedHash = await db.get(`ownerpassword.${message.guild.id}`);
       pendingPassword.delete(message.author.id);
-      if (!storedPw) {
+      if (!deleted) {
+        // If we couldn't delete the message, the password is exposed in chat — warn.
+        message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xffcc00).setDescription("⚠️ I couldn't delete your message (missing **Manage Messages** here). Delete it yourself and consider changing the password.")]}).then(m => setTimeout(() => m.delete().catch(() => {}), 10000)).catch(() => {});
+      }
+      if (!storedHash) {
         return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('❌ No password set. The server owner can set one with `-setownerpassword <password>`.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 6000));
       }
-      if (attempt !== storedPw) {
+      if (hashPw(attempt) !== storedHash) {
         return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('❌ Wrong password.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 4000));
       }
       return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('⚙️ Owner Commands').addFields(
@@ -665,8 +975,8 @@ client.on('messageCreate', async message => {
   // ── -cmdsowner ────────────────────────────────────────────────
   if (cmd === 'cmdsowner') {
     await message.delete().catch(() => {});
-    const storedPw = await db.get(`ownerpassword.${message.guild.id}`);
-    if (!storedPw) {
+    const storedHash = await db.get(`ownerpassword.${message.guild.id}`);
+    if (!storedHash) {
       if (message.author.id !== message.guild.ownerId) return;
       return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xffcc00).setDescription('⚠️ No password set yet. Use `-setownerpassword <password>` first.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 8000));
     }
@@ -683,7 +993,8 @@ client.on('messageCreate', async message => {
     await message.delete().catch(() => {});
     const pw = args.join(' ');
     if (!pw) return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('❌ Usage: `-setownerpassword <password>`')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
-    await db.set(`ownerpassword.${message.guild.id}`, pw);
+    // stored as a sha256 hash — never plaintext
+    await db.set(`ownerpassword.${message.guild.id}`, hashPw(pw));
     return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription('✅ Owner password set. Use `-cmdsowner` to access owner commands.')]}).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
   }
 
@@ -695,6 +1006,9 @@ client.on('messageCreate', async message => {
         { name: '🎭 Roles',      value: '`-role @user <role name>` — toggle (run again to remove)' },
         { name: '📨 Invites',    value: '`-invites [@user]` — see invite count\n`-inviteleaderboard` — top inviters\n`-invites reset @user` — reset count (admin)' },
         { name: '🎉 Giveaways',  value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`\nAny duration from `1s` to `7d`' },
+        { name: '🎲 Fun',        value: '`-8ball <question>` `-coinflip` `-dice [sides]`\n`-rps <rock|paper|scissors>` `-choose a | b | c`\n`-ship @a @b` `-mock <text>` `-reverse <text>`\n`-meme` `-joke`' },
+        { name: '🔧 Utility',    value: '`-userinfo [@user]` `-serverinfo` `-avatar [@user]`\n`-roleinfo <role>` `-membercount` `-ping` `-uptime`\n`-poll <question>` or `-poll q | opt1 | opt2`\n`-snipe` `-afk [reason]` `-remindme <duration> <text>`' },
+        { name: '🧹 Automod & Logs', value: '`-automod enable/disable/status`\n`-automod antispam/antilink/anticaps/antimention on/off`\n`-automod filter add/remove/list <word>`\n`-modlog #channel` `-modlog disable`' },
       ).setFooter({ text: `Prefix: ${PREFIX}` })],
     });
   }
@@ -716,16 +1030,14 @@ client.on('messageCreate', async message => {
   }
 
   // ── -inviteleaderboard ─────────────────────────────────────────
+  // One db read for the whole guild instead of a member fetch + one read per member.
   if (cmd === 'inviteleaderboard' || cmd === 'invlb') {
-    const members = await message.guild.members.fetch().catch(() => null);
-    if (!members) return message.reply('❌ Could not fetch members.');
-    const entries = [];
-    for (const [uid] of members) {
-      const count = (await db.get(`invites.${message.guild.id}.${uid}`)) ?? 0;
-      if (count > 0) entries.push({ uid, count });
-    }
-    entries.sort((a, b) => b.count - a.count);
-    const top = entries.slice(0, 10);
+    const all = (await db.get(`invites.${message.guild.id}`)) || {};
+    const top = Object.entries(all)
+      .filter(([, count]) => typeof count === 'number' && count > 0)
+      .map(([uid, count]) => ({ uid, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
     if (!top.length) return message.reply('❌ No invite data yet.');
     const lines = top.map((e, i) => `**${i + 1}.** <@${e.uid}> — **${e.count}** invite${e.count !== 1 ? 's' : ''}`);
     return message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📨 Invite Leaderboard').setDescription(lines.join('\n')).setFooter({ text: `${message.guild.name} • Top ${top.length}` }).setTimestamp()] });
@@ -735,13 +1047,13 @@ client.on('messageCreate', async message => {
   if (cmd === 'ban') {
     if (!message.member.permissions.has(PermissionFlagsBits.BanMembers))
       return message.reply('❌ You need **Ban Members** permission.');
-    const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
+    const t = await resolveMember(message, args[0]);
     if (!t) return message.reply('❌ Usage: `-ban @user [reason]`');
     const r = args.slice(1).join(' ') || 'No reason provided';
     if (t.id === message.author.id) return message.reply('❌ Cannot ban yourself.');
     if (t.id === message.guild.ownerId) return message.reply('❌ Cannot ban the server owner.');
     if (!t.bannable) return message.reply("❌ I can't ban that user.");
-    if (message.member.roles.highest.position <= t.roles.highest.position) return message.reply('❌ That user has an equal or higher role.');
+    if (message.member.roles.highest.position <= t.roles.highest.position && message.author.id !== message.guild.ownerId) return message.reply('❌ That user has an equal or higher role.');
     await t.send({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle(`Banned from ${message.guild.name}`).addFields({ name: 'Reason', value: r })] }).catch(() => {});
     await t.ban({ reason: `${message.author.tag}: ${r}` });
     message.reply({ embeds: [new EmbedBuilder().setColor(0xff4444).setTitle('🔨 Banned').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
@@ -751,13 +1063,13 @@ client.on('messageCreate', async message => {
   else if (cmd === 'kick') {
     if (!message.member.permissions.has(PermissionFlagsBits.KickMembers))
       return message.reply('❌ You need **Kick Members** permission.');
-    const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
+    const t = await resolveMember(message, args[0]);
     if (!t) return message.reply('❌ Usage: `-kick @user [reason]`');
     const r = args.slice(1).join(' ') || 'No reason provided';
     if (t.id === message.author.id) return message.reply('❌ Cannot kick yourself.');
     if (t.id === message.guild.ownerId) return message.reply('❌ Cannot kick the server owner.');
     if (!t.kickable) return message.reply("❌ I can't kick that user.");
-    if (message.member.roles.highest.position <= t.roles.highest.position) return message.reply('❌ That user has an equal or higher role.');
+    if (message.member.roles.highest.position <= t.roles.highest.position && message.author.id !== message.guild.ownerId) return message.reply('❌ That user has an equal or higher role.');
     await t.send({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle(`Kicked from ${message.guild.name}`).addFields({ name: 'Reason', value: r })] }).catch(() => {});
     await t.kick(`${message.author.tag}: ${r}`);
     message.reply({ embeds: [new EmbedBuilder().setColor(0xff8800).setTitle('👢 Kicked').addFields({ name: 'User', value: t.user.tag, inline: true }, { name: 'Moderator', value: message.author.tag, inline: true }, { name: 'Reason', value: r }).setTimestamp()] });
@@ -767,14 +1079,14 @@ client.on('messageCreate', async message => {
   else if (cmd === 'mute') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
       return message.reply('❌ You need **Manage Roles** permission.');
-    const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
+    const t = await resolveMember(message, args[0]);
     if (!t) return message.reply('❌ Usage: `-mute @user <duration> [reason]`\nDurations: `30s` `5m` `1h` `12h` `1d` `7d`');
     const ms = parseDuration(args[1]?.toLowerCase());
     if (!ms) return message.reply('❌ Invalid duration. Examples: `30s` `5m` `1h` `12h` `1d` `7d`');
     const r = args.slice(2).join(' ') || 'No reason provided';
     if (t.id === message.author.id) return message.reply('❌ Cannot mute yourself.');
     if (t.id === message.guild.ownerId) return message.reply('❌ Cannot mute the server owner.');
-    if (message.member.roles.highest.position <= t.roles.highest.position) return message.reply('❌ That user has an equal or higher role.');
+    if (message.member.roles.highest.position <= t.roles.highest.position && message.author.id !== message.guild.ownerId) return message.reply('❌ That user has an equal or higher role.');
     const muteRole = await getMuteRole(message.guild).catch(() => null);
     if (!muteRole) return message.reply('❌ Failed to create/find the Muted role.');
     if (message.guild.members.me.roles.highest.position <= muteRole.position) return message.reply('❌ The Muted role is above my highest role — move it below my role.');
@@ -792,9 +1104,9 @@ client.on('messageCreate', async message => {
   else if (cmd === 'unmute') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageRoles))
       return message.reply('❌ You need **Manage Roles** permission.');
-    const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
+    const t = await resolveMember(message, args[0]);
     if (!t) return message.reply('❌ Usage: `-unmute @user`');
-    const muteRole = message.guild.roles.cache.find(r => r.name === 'Muted');
+    const muteRole = await getMuteRole(message.guild, false);
     if (!muteRole || !t.roles.cache.has(muteRole.id)) return message.reply('❌ That user is not muted.');
     clearTimeout(muteTimers.get(`${message.guild.id}:${t.id}`));
     await unmuteUser(message.guild, t.id, `Unmuted by ${message.author.tag}`);
@@ -805,7 +1117,7 @@ client.on('messageCreate', async message => {
   else if (cmd === 'warn') {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
-    const t = message.mentions.members.first() || await message.guild.members.fetch(args[0]).catch(() => null);
+    const t = await resolveMember(message, args[0]);
     if (!t) return message.reply('❌ Usage: `-warn @user <reason>`');
     const r = args.slice(1).join(' ');
     if (!r) return message.reply('❌ Provide a reason.');
@@ -822,9 +1134,7 @@ client.on('messageCreate', async message => {
     if (!message.member.permissions.has(PermissionFlagsBits.ModerateMembers))
       return message.reply('❌ You need **Timeout Members** permission.');
     const isClear = args[0]?.toLowerCase() === 'clear';
-    const t = isClear
-      ? message.mentions.users.first() || await client.users.fetch(args[1]).catch(() => null)
-      : message.mentions.users.first() || await client.users.fetch(args[0]).catch(() => null);
+    const t = await resolveUser(message, isClear ? args[1] : args[0]);
     if (!t) return message.reply('❌ Usage: `-warnings @user` or `-warnings clear @user`');
     const key = `warnings.${message.guild.id}.${t.id}`;
     if (isClear) { await db.delete(key); return message.reply(`✅ Cleared warnings for **${t.tag}**.`); }
@@ -914,7 +1224,7 @@ client.on('messageCreate', async message => {
     const role = message.mentions.roles.first() || message.guild.roles.cache.find(r => r.name.toLowerCase() === rn.toLowerCase());
     if (!role) return message.reply(`❌ No role named **${rn}**.`);
     if (message.guild.members.me.roles.highest.position <= role.position) return message.reply('❌ That role is above my highest role.');
-    if (message.member.roles.highest.position <= role.position) return message.reply('❌ That role is above your highest role.');
+    if (message.member.roles.highest.position <= role.position && message.author.id !== message.guild.ownerId) return message.reply('❌ That role is above your highest role.');
     if (role.managed) return message.reply('❌ Managed by an integration.');
     if (t.roles.cache.has(role.id)) {
       await t.roles.remove(role, `Removed by ${message.author.tag}`);
@@ -948,17 +1258,18 @@ client.on('messageCreate', async message => {
       if (!cid) return message.reply('❌ Set a channel first.');
       const chan = message.guild.channels.cache.get(cid) ?? await message.guild.channels.fetch(cid).catch(() => null);
       if (!chan) return message.reply('❌ Channel no longer exists.');
-      let msg = await db.get(`welcome.${gid}.message`);
-      if (msg) {
-        msg = msg
-          .replace(/{user}/g,        `<@${message.author.id}>`)
-          .replace(/{username}/g,     message.author.username)
-          .replace(/{server}/g,       message.guild.name)
-          .replace(/{memberCount}/g,  message.guild.memberCount)
-          .replace(/{inviter}/g,      `<@${message.author.id}>`)
-          .replace(/{inviterTag}/g,   message.author.tag)
-          .replace(/{inviterCount}/g, '1');
-        await chan.send(msg);
+      const template = await db.get(`welcome.${gid}.message`);
+      if (template) {
+        const msg = fillPlaceholders(template, {
+          user:         `<@${message.author.id}>`,
+          username:     message.author.username,
+          server:       message.guild.name,
+          memberCount:  message.guild.memberCount,
+          inviter:      `<@${message.author.id}>`,
+          inviterTag:   message.author.tag,
+          inviterCount: 1,
+        });
+        await chan.send({ content: msg, allowedMentions: { users: [message.author.id] } });
       } else {
         await chan.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`Welcome to ${message.guild.name}!`).setDescription(`Hey <@${message.author.id}>, member **#${message.guild.memberCount}**!\n\nInvited by **${message.author.tag}** · **1** invite (test)`).setThumbnail(message.author.displayAvatarURL()).setTimestamp()] });
       }
@@ -1032,7 +1343,6 @@ client.on('messageCreate', async message => {
       active: true,
     });
 
-    // Auto-end scheduled here
     scheduleGiveaway(message.guild.id, gMsg.id, endsAt);
     message.reply(`✅ Giveaway started! Ends <t:${Math.floor(endsAt / 1000)}:R> — [Jump to it](${gMsg.url})`);
   }
@@ -1066,18 +1376,12 @@ client.on('messageCreate', async message => {
   // ── -glist ─────────────────────────────────────────────────────
   else if (cmd === 'glist') {
     try {
-      const allEntries = await db.all();
-      const active = allEntries.filter(e =>
-        e.id.startsWith(`giveaways.${message.guild.id}.`) &&
-        e.id.split('.').length === 3 &&
-        e.value?.active
-      );
+      const guildGiveaways = (await db.get(`giveaways.${message.guild.id}`)) || {};
+      const active = Object.entries(guildGiveaways).filter(([, d]) => d?.active);
       if (!active.length) return message.reply('❌ No active giveaways.');
-      const lines = active.map(e => {
-        const mid  = e.id.split('.')[2];
-        const d    = e.value;
-        return `• **${d.prize}** — ${d.winnerCount} winner(s) — ends <t:${Math.floor(d.endsAt / 1000)}:R> — ID: \`${mid}\``;
-      });
+      const lines = active.map(([mid, d]) =>
+        `• **${d.prize}** — ${d.winnerCount} winner(s) — ends <t:${Math.floor(d.endsAt / 1000)}:R> — ID: \`${mid}\``
+      );
       message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎉 Active Giveaways').setDescription(lines.join('\n')).setTimestamp()] });
     } catch (e) {
       message.reply('❌ Could not fetch giveaway list.');
@@ -1095,7 +1399,7 @@ client.on('messageCreate', async message => {
       await db.set(`antinuke.${gid}.enabled`, true); clearCache(gid);
       await saveSnapshot(message.guild);
       snapCooldown.set(gid, Date.now());
-      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🛡️ Antinuke Enabled').setDescription('**Triggers at:** 2 deletions / bans / kicks in 4s\n**On trigger:** bans nuker + auto-restores channels\n**Snapshot:** taken now, refreshes every 30s\n\n⚠️ Give this bot the **highest role** so it can ban anyone.\n`-antinuke setlog #channel` — receive alerts\n`-antinuke whitelist add @user` — trust your admins')] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🛡️ Antinuke Enabled').setDescription('**Triggers at:** 3 deletions / bans / kicks in 4s\n**On trigger:** bans nuker + auto-restores channels\n**Snapshot:** taken now, refreshes every 30s\n\n⚠️ Give this bot the **highest role** so it can ban anyone.\n`-antinuke setlog #channel` — receive alerts\n`-antinuke whitelist add @user` — trust your admins')] });
     }
     if (sub === 'disable') {
       await db.set(`antinuke.${gid}.enabled`, false); clearCache(gid);
@@ -1155,6 +1459,298 @@ client.on('messageCreate', async message => {
     message.reply('❌ Subcommands: `enable` `disable` `setlog #ch` `snapshot` `whitelist add/remove @user` `status` `restore` `restore clear`');
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  //  FUN COMMANDS
+  // ═══════════════════════════════════════════════════════════════
+
+  // ── -8ball ─────────────────────────────────────────────────────
+  else if (cmd === '8ball') {
+    const q = args.join(' ');
+    if (!q) return message.reply('❌ Ask a question! `-8ball will I win?`');
+    const answer = EIGHTBALL[Math.floor(Math.random() * EIGHTBALL.length)];
+    message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('🎱 Magic 8-Ball').addFields({ name: 'Question', value: q.slice(0, 1024) }, { name: 'Answer', value: answer })] });
+  }
+
+  // ── -coinflip ──────────────────────────────────────────────────
+  else if (cmd === 'coinflip' || cmd === 'flip') {
+    message.reply(`🪙 **${Math.random() < 0.5 ? 'Heads' : 'Tails'}**!`);
+  }
+
+  // ── -dice ──────────────────────────────────────────────────────
+  else if (cmd === 'dice' || cmd === 'roll') {
+    const sides = parseInt(args[0]) || 6;
+    if (sides < 2 || sides > 1000) return message.reply('❌ Sides must be 2–1000.');
+    message.reply(`🎲 You rolled a **${Math.floor(Math.random() * sides) + 1}** (d${sides})`);
+  }
+
+  // ── -rps ───────────────────────────────────────────────────────
+  else if (cmd === 'rps') {
+    const choices = ['rock', 'paper', 'scissors'];
+    const you = args[0]?.toLowerCase();
+    if (!choices.includes(you)) return message.reply('❌ Usage: `-rps rock|paper|scissors`');
+    const bot = choices[Math.floor(Math.random() * 3)];
+    const emoji = { rock: '🪨', paper: '📄', scissors: '✂️' };
+    let result;
+    if (you === bot) result = "It's a **tie**!";
+    else if ((you === 'rock' && bot === 'scissors') || (you === 'paper' && bot === 'rock') || (you === 'scissors' && bot === 'paper')) result = 'You **win**! 🎉';
+    else result = 'You **lose**! 😈';
+    message.reply(`${emoji[you]} vs ${emoji[bot]} — ${result}`);
+  }
+
+  // ── -choose ────────────────────────────────────────────────────
+  else if (cmd === 'choose' || cmd === 'pick') {
+    const options = args.join(' ').split('|').map(s => s.trim()).filter(Boolean);
+    if (options.length < 2) return message.reply('❌ Usage: `-choose pizza | burgers | tacos`');
+    message.reply({ content: `🤔 I choose... **${options[Math.floor(Math.random() * options.length)]}**`, allowedMentions: { parse: [] } });
+  }
+
+  // ── -ship ──────────────────────────────────────────────────────
+  else if (cmd === 'ship') {
+    const users = [...message.mentions.users.values()];
+    if (users.length < 1) return message.reply('❌ Usage: `-ship @user` or `-ship @user1 @user2`');
+    const a = users[0], b = users[1] ?? message.author;
+    // deterministic — the same pair always gets the same score
+    const score = Number((BigInt(a.id) + BigInt(b.id)) % 101n);
+    const bar = '█'.repeat(Math.round(score / 10)).padEnd(10, '░');
+    const verdict = score > 80 ? '💞 A perfect match!' : score > 60 ? '💖 Pretty good!' : score > 40 ? '💛 Could work…' : score > 20 ? '💔 Not looking great.' : '🥶 Absolutely not.';
+    message.reply({ embeds: [new EmbedBuilder().setColor(0xff66aa).setTitle('💘 Ship-o-meter').setDescription(`**${a.username}** ❤️ **${b.username}**\n\n\`${bar}\` **${score}%**\n${verdict}`)] });
+  }
+
+  // ── -mock ──────────────────────────────────────────────────────
+  else if (cmd === 'mock') {
+    const text = args.join(' ');
+    if (!text) return message.reply('❌ Usage: `-mock <text>`');
+    const mocked = [...text].map((c, i) => i % 2 ? c.toUpperCase() : c.toLowerCase()).join('');
+    message.reply({ content: mocked.slice(0, 2000), allowedMentions: { parse: [] } });
+  }
+
+  // ── -reverse ───────────────────────────────────────────────────
+  else if (cmd === 'reverse') {
+    const text = args.join(' ');
+    if (!text) return message.reply('❌ Usage: `-reverse <text>`');
+    message.reply({ content: [...text].reverse().join('').slice(0, 2000), allowedMentions: { parse: [] } });
+  }
+
+  // ── -meme ──────────────────────────────────────────────────────
+  else if (cmd === 'meme') {
+    try {
+      const res  = await fetch('https://meme-api.com/gimme');
+      const data = await res.json();
+      if (!data?.url || data.nsfw) return message.reply('❌ Couldn\'t find a meme, try again.');
+      message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(data.title?.slice(0, 256) || 'Meme').setImage(data.url).setFooter({ text: `👍 ${data.ups ?? 0} • r/${data.subreddit ?? '?'}` })] });
+    } catch { message.reply('❌ Meme API is down, try again later.'); }
+  }
+
+  // ── -joke ──────────────────────────────────────────────────────
+  else if (cmd === 'joke') {
+    try {
+      const res  = await fetch('https://icanhazdadjoke.com/', { headers: { Accept: 'application/json' } });
+      const data = await res.json();
+      if (!data?.joke) return message.reply('❌ No joke found, try again.');
+      message.reply(`😄 ${data.joke}`);
+    } catch { message.reply('❌ Joke API is down, try again later.'); }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  UTILITY COMMANDS
+  // ═══════════════════════════════════════════════════════════════
+
+  // ── -ping ──────────────────────────────────────────────────────
+  else if (cmd === 'ping') {
+    const sent = await message.reply('🏓 Pinging…');
+    sent.edit(`🏓 Pong! Roundtrip: **${sent.createdTimestamp - message.createdTimestamp}ms** • API: **${Math.round(client.ws.ping)}ms**`);
+  }
+
+  // ── -uptime ────────────────────────────────────────────────────
+  else if (cmd === 'uptime') {
+    const s = Math.floor(process.uptime());
+    const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    message.reply(`⏱️ Online for **${d}d ${h}h ${m}m ${s % 60}s**`);
+  }
+
+  // ── -avatar ────────────────────────────────────────────────────
+  else if (cmd === 'avatar' || cmd === 'av') {
+    const t = message.mentions.users.first() ?? (args[0] ? await resolveUser(message, args[0]) : message.author) ?? message.author;
+    const url = t.displayAvatarURL({ size: 1024 });
+    message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`🖼️ ${t.username}'s avatar`).setImage(url).setDescription(`[Open in browser](${url})`)] });
+  }
+
+  // ── -userinfo ──────────────────────────────────────────────────
+  else if (cmd === 'userinfo' || cmd === 'whois') {
+    const t = message.mentions.members.first() ?? (args[0] ? await resolveMember(message, args[0]) : message.member) ?? message.member;
+    const roles = t.roles.cache.filter(r => r.id !== message.guild.id).sort((a, b) => b.position - a.position);
+    const roleList = roles.size ? [...roles.values()].slice(0, 15).join(' ') + (roles.size > 15 ? ` +${roles.size - 15} more` : '') : 'None';
+    message.reply({ embeds: [new EmbedBuilder().setColor(t.displayHexColor === '#000000' ? 0x5865f2 : t.displayColor).setTitle(`👤 ${t.user.tag}`).setThumbnail(t.user.displayAvatarURL()).addFields(
+      { name: 'ID',            value: t.id, inline: true },
+      { name: 'Nickname',      value: t.nickname ?? 'None', inline: true },
+      { name: 'Bot',           value: t.user.bot ? 'Yes' : 'No', inline: true },
+      { name: 'Account Created', value: `<t:${Math.floor(t.user.createdTimestamp / 1000)}:R>`, inline: true },
+      { name: 'Joined Server',   value: t.joinedTimestamp ? `<t:${Math.floor(t.joinedTimestamp / 1000)}:R>` : 'Unknown', inline: true },
+      { name: `Roles [${roles.size}]`, value: roleList.slice(0, 1024) },
+    ).setTimestamp()] });
+  }
+
+  // ── -serverinfo ────────────────────────────────────────────────
+  else if (cmd === 'serverinfo' || cmd === 'si') {
+    const g = message.guild;
+    const chans = g.channels.cache;
+    message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`🏠 ${g.name}`).setThumbnail(g.iconURL() ?? '').addFields(
+      { name: 'Owner',    value: `<@${g.ownerId}>`, inline: true },
+      { name: 'Members',  value: String(g.memberCount), inline: true },
+      { name: 'Created',  value: `<t:${Math.floor(g.createdTimestamp / 1000)}:R>`, inline: true },
+      { name: 'Channels', value: `💬 ${chans.filter(c => c.type === 0).size} text • 🔊 ${chans.filter(c => c.type === 2).size} voice • 📁 ${chans.filter(c => c.type === 4).size} categories`, inline: true },
+      { name: 'Roles',    value: String(g.roles.cache.size), inline: true },
+      { name: 'Boosts',   value: `${g.premiumSubscriptionCount ?? 0} (Level ${g.premiumTier})`, inline: true },
+    ).setFooter({ text: `ID: ${g.id}` }).setTimestamp()] });
+  }
+
+  // ── -roleinfo ──────────────────────────────────────────────────
+  else if (cmd === 'roleinfo') {
+    const rn = args.join(' ').replace(/<@&\d+>\s*/g, '').trim();
+    const role = message.mentions.roles.first() || message.guild.roles.cache.find(r => r.name.toLowerCase() === rn.toLowerCase());
+    if (!role) return message.reply('❌ Usage: `-roleinfo <role name or @role>`');
+    message.reply({ embeds: [new EmbedBuilder().setColor(role.color || 0x5865f2).setTitle(`🎭 ${role.name}`).addFields(
+      { name: 'ID',          value: role.id, inline: true },
+      { name: 'Members',     value: String(role.members.size), inline: true },
+      { name: 'Color',       value: role.hexColor, inline: true },
+      { name: 'Position',    value: String(role.position), inline: true },
+      { name: 'Mentionable', value: role.mentionable ? 'Yes' : 'No', inline: true },
+      { name: 'Hoisted',     value: role.hoist ? 'Yes' : 'No', inline: true },
+      { name: 'Created',     value: `<t:${Math.floor(role.createdTimestamp / 1000)}:R>`, inline: true },
+    )] });
+  }
+
+  // ── -membercount ───────────────────────────────────────────────
+  else if (cmd === 'membercount' || cmd === 'mc') {
+    message.reply(`👥 **${message.guild.name}** has **${message.guild.memberCount}** members.`);
+  }
+
+  // ── -poll ──────────────────────────────────────────────────────
+  else if (cmd === 'poll') {
+    const raw = args.join(' ');
+    if (!raw) return message.reply('❌ Usage: `-poll <question>` or `-poll question | option1 | option2`');
+    const parts = raw.split('|').map(s => s.trim()).filter(Boolean);
+    if (parts.length === 1) {
+      const p = await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle('📊 Poll').setDescription(parts[0]).setFooter({ text: `Poll by ${message.author.tag}` }).setTimestamp()] });
+      await p.react('👍'); await p.react('👎'); await p.react('🤷');
+    } else {
+      const question = parts.shift();
+      if (parts.length > 10) return message.reply('❌ Max 10 options.');
+      const desc = parts.map((o, i) => `${POLL_EMOJIS[i]} ${o}`).join('\n');
+      const p = await message.channel.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`📊 ${question}`).setDescription(desc).setFooter({ text: `Poll by ${message.author.tag}` }).setTimestamp()] });
+      for (let i = 0; i < parts.length; i++) await p.react(POLL_EMOJIS[i]);
+    }
+    await message.delete().catch(() => {});
+  }
+
+  // ── -snipe ─────────────────────────────────────────────────────
+  else if (cmd === 'snipe') {
+    const s = snipes.get(message.channel.id);
+    if (!s) return message.reply('❌ Nothing to snipe in this channel.');
+    message.reply({ embeds: [new EmbedBuilder().setColor(0x5865f2).setAuthor({ name: s.authorTag, iconURL: s.authorAvatar }).setDescription(s.content.slice(0, 2048)).setFooter({ text: 'Deleted' }).setTimestamp(s.time)] });
+  }
+
+  // ── -afk ───────────────────────────────────────────────────────
+  else if (cmd === 'afk') {
+    const reason = args.join(' ') || 'AFK';
+    await db.set(`afk.${message.guild.id}.${message.author.id}`, { reason: reason.slice(0, 200), since: Date.now() });
+    message.reply({ content: `💤 You're now AFK: **${reason.slice(0, 200)}**`, allowedMentions: { parse: [] } });
+  }
+
+  // ── -remindme ──────────────────────────────────────────────────
+  else if (cmd === 'remindme' || cmd === 'remind') {
+    const ms = parseDuration(args[0]?.toLowerCase());
+    if (!ms) return message.reply('❌ Usage: `-remindme <duration> <text>` — e.g. `-remindme 2h take out the trash`');
+    const text = args.slice(1).join(' ') || 'Reminder!';
+    const id = `${message.author.id}-${Date.now()}`;
+    const rem = { userId: message.author.id, channelId: message.channel.id, text: text.slice(0, 1000), endsAt: Date.now() + ms };
+    await db.set(`reminders.${id}`, rem);
+    scheduleReminder(id, rem);
+    message.reply(`⏰ Got it! I'll remind you <t:${Math.floor(rem.endsAt / 1000)}:R>.`);
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  AUTOMOD & LOGGING COMMANDS
+  // ═══════════════════════════════════════════════════════════════
+
+  // ── -automod ───────────────────────────────────────────────────
+  else if (cmd === 'automod' || cmd === 'am') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    const gid = message.guild.id;
+    const sub = args[0]?.toLowerCase();
+    const key = `automod.${gid}`;
+    const cur = (await db.get(key)) || {};
+
+    if (sub === 'enable') {
+      await db.set(key, { ...cur, enabled: true }); clearAmCache(gid);
+      return message.reply({ embeds: [new EmbedBuilder().setColor(0x00cc44).setTitle('🧹 Automod Enabled').setDescription('**On by default:** anti-spam, anti-mention-spam\n**Off by default:** anti-link, anti-caps, word filter\n\nToggle with `-automod antilink on`, add words with `-automod filter add <word>`.\nMods with **Manage Messages** are exempt.')] });
+    }
+    if (sub === 'disable') {
+      await db.set(key, { ...cur, enabled: false }); clearAmCache(gid);
+      return message.reply('✅ Automod disabled.');
+    }
+    if (['antispam', 'antilink', 'anticaps', 'antimention'].includes(sub)) {
+      const state = args[1]?.toLowerCase();
+      if (!['on', 'off'].includes(state)) return message.reply(`❌ Usage: \`-automod ${sub} on/off\``);
+      await db.set(key, { ...cur, [sub]: state === 'on' }); clearAmCache(gid);
+      return message.reply(`✅ **${sub}** is now **${state}**.`);
+    }
+    if (sub === 'filter') {
+      const action = args[1]?.toLowerCase();
+      const word   = args.slice(2).join(' ').toLowerCase().trim();
+      const list   = cur.filter || [];
+      if (action === 'add') {
+        if (!word) return message.reply('❌ Usage: `-automod filter add <word>`');
+        if (list.includes(word)) return message.reply('❌ Already filtered.');
+        list.push(word);
+        await db.set(key, { ...cur, filter: list }); clearAmCache(gid);
+        await message.delete().catch(() => {});
+        return message.channel.send(`✅ Added a word to the filter. (**${list.length}** total)`);
+      }
+      if (action === 'remove') {
+        if (!word || !list.includes(word)) return message.reply('❌ That word is not in the filter.');
+        await db.set(key, { ...cur, filter: list.filter(w => w !== word) }); clearAmCache(gid);
+        await message.delete().catch(() => {});
+        return message.channel.send(`✅ Removed a word from the filter. (**${list.length - 1}** total)`);
+      }
+      if (action === 'list' || !action) {
+        if (!list.length) return message.reply('❌ No filtered words. Add with `-automod filter add <word>`');
+        return message.author.send({ embeds: [new EmbedBuilder().setColor(0x5865f2).setTitle(`🧹 Filtered Words — ${message.guild.name}`).setDescription(list.map(w => `• ${w}`).join('\n').slice(0, 4000))] })
+          .then(() => message.reply('📬 Sent you the filter list in DMs.'))
+          .catch(() => message.reply('❌ I couldn\'t DM you — enable DMs from server members.'));
+      }
+      return message.reply('❌ Usage: `-automod filter add/remove/list <word>`');
+    }
+    if (sub === 'status' || !sub) {
+      const am = await getAutomod(gid);
+      const on = v => v ? '✅ On' : '❌ Off';
+      return message.reply({ embeds: [new EmbedBuilder().setColor(am.enabled ? 0x00cc44 : 0xff4444).setTitle('🧹 Automod Status').addFields(
+        { name: 'Automod',       value: on(am.enabled), inline: true },
+        { name: 'Anti-Spam',     value: on(am.antispam), inline: true },
+        { name: 'Anti-Link',     value: on(am.antilink), inline: true },
+        { name: 'Anti-Caps',     value: on(am.anticaps), inline: true },
+        { name: 'Anti-Mention',  value: on(am.antimention), inline: true },
+        { name: 'Filtered Words', value: String(am.filter.length), inline: true },
+      ).setTimestamp()] });
+    }
+    message.reply('❌ Subcommands: `enable` `disable` `status` `antispam/antilink/anticaps/antimention on/off` `filter add/remove/list`');
+  }
+
+  // ── -modlog ────────────────────────────────────────────────────
+  else if (cmd === 'modlog') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
+      return message.reply('❌ You need **Manage Server** permission.');
+    if (args[0]?.toLowerCase() === 'disable') {
+      await db.delete(`modlog.${message.guild.id}`);
+      return message.reply('✅ Mod logging disabled.');
+    }
+    const ch = message.mentions.channels.first();
+    if (!ch) return message.reply('❌ Usage: `-modlog #channel` or `-modlog disable`');
+    await db.set(`modlog.${message.guild.id}`, ch.id);
+    return message.reply(`✅ Mod logs → ${ch}. Logging: message deletes/edits, joins, leaves, bans, and automod actions.`);
+  }
+
   // ── -say ──────────────────────────────────────────────────────
   else if (cmd === 'say') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild))
@@ -1162,7 +1758,8 @@ client.on('messageCreate', async message => {
     const text = args.join(' ');
     if (!text) return message.reply('❌ Usage: `-say <message>`');
     await message.delete().catch(() => {});
-    await message.channel.send(text);
+    // allowedMentions: parse [] — the bot will never ping @everyone/roles/users via -say
+    await message.channel.send({ content: text, allowedMentions: { parse: [] } });
   }
 });
 
