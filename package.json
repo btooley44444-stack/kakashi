@@ -14,4 +14,3 @@
     "better-sqlite3": "^9.4.3"
   }
 }
-npm install @napi-rs/canvas
