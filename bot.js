@@ -322,6 +322,14 @@ function drawHeart(ctx, cx, cy, w, h, color) {
 
 async function makeShipCard(a, b, score) {
   const { createCanvas, loadImage } = canvasLib;
+
+  // download avatars ourselves — loadImage(url) gets rejected by Discord's CDN (415)
+  const fetchImage = async (url) => {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`avatar fetch failed (${res.status})`);
+    return loadImage(Buffer.from(await res.arrayBuffer()));
+  };
+
   const W = 700, H = 310;
   const canvas = createCanvas(W, H);
   const ctx = canvas.getContext('2d');
@@ -329,8 +337,8 @@ async function makeShipCard(a, b, score) {
   const color = score >= 70 ? '#ff4d8d' : score >= 40 ? '#ffaa33' : '#8899aa';
 
   const [imgA, imgB] = await Promise.all([
-    loadImage(a.displayAvatarURL({ extension: 'png', size: 256 })),
-    loadImage(b.displayAvatarURL({ extension: 'png', size: 256 })),
+    fetchImage(a.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true })),
+    fetchImage(b.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true })),
   ]);
 
   // avatars in circles with a colored ring
