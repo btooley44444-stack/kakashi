@@ -3,6 +3,7 @@ const {
   EmbedBuilder, PermissionFlagsBits,
   AuditLogEvent, ActivityType, Collection,
   ActionRowBuilder, StringSelectMenuBuilder, ComponentType,
+  AttachmentBuilder,
 } = require('discord.js');
 const { QuickDB } = require('quick.db');
 const crypto = require('crypto');
@@ -289,6 +290,87 @@ const EIGHTBALL = [
   'Outlook not so good.', 'Very doubtful.', 'Absolutely not.',
 ];
 const POLL_EMOJIS = ['🇦', '🇧', '🇨', '🇩', '🇪', '🇫', '🇬', '🇭', '🇮', '🇯'];
+
+// ─────────────────────────────────────────────
+//  SHIP CARD IMAGE (needs: npm install @napi-rs/canvas)
+//  Falls back to a text embed if the library isn't installed.
+// ─────────────────────────────────────────────
+let canvasLib = null;
+try { canvasLib = require('@napi-rs/canvas'); } catch { console.warn('[ship] @napi-rs/canvas not installed — ship cards will be text-only'); }
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawHeart(ctx, cx, cy, w, h, color) {
+  const top = h * 0.3;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy + top);
+  ctx.bezierCurveTo(cx, cy, cx - w / 2, cy, cx - w / 2, cy + top);
+  ctx.bezierCurveTo(cx - w / 2, cy + (h + top) / 2, cx, cy + (h + top) / 1.4, cx, cy + h);
+  ctx.bezierCurveTo(cx, cy + (h + top) / 1.4, cx + w / 2, cy + (h + top) / 2, cx + w / 2, cy + top);
+  ctx.bezierCurveTo(cx + w / 2, cy, cx, cy, cx, cy + top);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+async function makeShipCard(a, b, score) {
+  const { createCanvas, loadImage } = canvasLib;
+  const W = 700, H = 310;
+  const canvas = createCanvas(W, H);
+  const ctx = canvas.getContext('2d');
+
+  const color = score >= 70 ? '#ff4d8d' : score >= 40 ? '#ffaa33' : '#8899aa';
+
+  const [imgA, imgB] = await Promise.all([
+    loadImage(a.displayAvatarURL({ extension: 'png', size: 256 })),
+    loadImage(b.displayAvatarURL({ extension: 'png', size: 256 })),
+  ]);
+
+  // avatars in circles with a colored ring
+  const r = 85, yC = 125;
+  const drawAvatar = (img, xC) => {
+    ctx.save();
+    ctx.beginPath(); ctx.arc(xC, yC, r, 0, Math.PI * 2); ctx.closePath(); ctx.clip();
+    ctx.drawImage(img, xC - r, yC - r, r * 2, r * 2);
+    ctx.restore();
+    ctx.beginPath(); ctx.arc(xC, yC, r, 0, Math.PI * 2);
+    ctx.lineWidth = 6; ctx.strokeStyle = color; ctx.stroke();
+  };
+  drawAvatar(imgA, 130);
+  drawAvatar(imgB, 570);
+
+  // heart between them (broken-hearted gray at low scores)
+  drawHeart(ctx, 350, yC - 55, 115, 115, score >= 40 ? '#ff4d6d' : '#556');
+
+  // progress bar
+  const bx = 100, by = 250, bw = 500, bh = 36, rad = 18;
+  roundRect(ctx, bx, by, bw, bh, rad);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fill();
+  if (score > 0) {
+    const fw = Math.max((bw * score) / 100, rad * 2);
+    roundRect(ctx, bx, by, fw, bh, rad);
+    const grad = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+    grad.addColorStop(0, '#ff9a9e');
+    grad.addColorStop(1, '#ff2d6d');
+    ctx.fillStyle = grad;
+    ctx.fill();
+  }
+  ctx.font = 'bold 22px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(`${score}%`, bx + bw / 2, by + bh / 2 + 1);
+
+  return new AttachmentBuilder(await canvas.encode('png'), { name: 'ship.png' });
+}
 
 // ─────────────────────────────────────────────
 //  HELP MENU DATA
@@ -1650,11 +1732,6 @@ client.on('messageCreate', async message => {
     const shipName = (a.username.slice(0, Math.ceil(a.username.length / 2)) +
                       b.username.slice(Math.floor(b.username.length / 2))).slice(0, 32);
 
-    // fancy heart bar
-    const filled = Math.round(score / 10);
-    const heart  = score >= 90 ? '💖' : score >= 70 ? '❤️' : score >= 50 ? '🧡' : score >= 30 ? '💛' : '🖤';
-    const bar    = heart.repeat(filled) + '🤍'.repeat(10 - filled);
-
     const verdict =
       score === 100 ? '💍 SOULMATES. Book the venue.' :
       score >= 90   ? '💖 Written in the stars!' :
@@ -1665,10 +1742,32 @@ client.on('messageCreate', async message => {
       score === 0   ? '☠️ Restraining order territory.' :
                       '🥶 Absolutely not.';
 
+    const embedColor = score >= 70 ? 0xff4d8d : score >= 40 ? 0xffaa33 : 0x8899aa;
+
+    // image card (like the big bots) — falls back to text if canvas isn't installed
+    if (canvasLib) {
+      try {
+        const card = await makeShipCard(a, b, score);
+        return message.reply({
+          embeds: [new EmbedBuilder()
+            .setColor(embedColor)
+            .setTitle('💘 Ship-o-meter 💘')
+            .setDescription(`✨ **${a.username}** ✕ **${b.username}** ✨\n💞 Ship name: **${shipName}**\n\n**${verdict}**`)
+            .setImage('attachment://ship.png')
+            .setFooter({ text: 'Cupid has spoken 🏹' })],
+          files: [card],
+        });
+      } catch (e) { console.error('[ship card]', e.message); }
+    }
+
+    // text fallback
+    const filled = Math.round(score / 10);
+    const heart  = score >= 90 ? '💖' : score >= 70 ? '❤️' : score >= 50 ? '🧡' : score >= 30 ? '💛' : '🖤';
+    const bar    = heart.repeat(filled) + '🤍'.repeat(10 - filled);
     message.reply({ embeds: [new EmbedBuilder()
-      .setColor(score >= 70 ? 0xff4d8d : score >= 40 ? 0xffaa33 : 0x8899aa)
+      .setColor(embedColor)
       .setTitle('💘 Ship-o-meter 💘')
-      .setDescription(`✨ **${a.username}** ✕ **${b.username}** ✨\n\n> 💞 Ship name: **${shipName}**\n\n${bar}\n\n# ${score}%\n${verdict}`)
+      .setDescription(`✨ **${a.username}** ✕ **${b.username}** ✨\n💞 Ship name: **${shipName}**\n\n${bar}  **${score}%**\n\n**${verdict}**`)
       .setFooter({ text: 'Cupid has spoken 🏹' })] });
   }
 
@@ -1986,5 +2085,7 @@ client.on('messageCreate', async message => {
     await message.channel.send({ content: text, allowedMentions: { parse: [] } });
   }
 });
+
+client.login(process.env.BOT_TOKEN);
 
 client.login(process.env.BOT_TOKEN);
