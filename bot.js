@@ -1058,6 +1058,7 @@ client.on('messageCreate', async message => {
         { name: '🎉 Giveaways',      value: '`-gcreate <duration> <winners> <prize>`\n`-gend <messageId>`\n`-greroll <messageId>`\n`-glist`' },
         { name: '🔒 Lock Whitelist', value: '`-lockwhitelist add @role`\n`-lockwhitelist remove @role`\n`-lockwhitelist list`' },
         { name: '🔑 Password',       value: '`-setownerpassword <password>`' },
+        { name: '🤫 Secret',         value: '`-shiprig @a @b <0-100>` — rig the ship-o-meter\n`-shiprig clear [@a @b]` — un-rig one pair or all' },
       ).setFooter({ text: `Only you can see this • Auto-deletes in 30s • Prefix: ${PREFIX}` })] }).then(m => setTimeout(() => m.delete().catch(() => {}), 30000));
     }
   }
@@ -1639,11 +1640,36 @@ client.on('messageCreate', async message => {
     const users = [...message.mentions.users.values()];
     if (users.length < 1) return message.reply('❌ Usage: `-ship @user` or `-ship @user1 @user2`');
     const a = users[0], b = users[1] ?? message.author;
-    // deterministic — the same pair always gets the same score
-    const score = Number((BigInt(a.id) + BigInt(b.id)) % 101n);
-    const bar = '█'.repeat(Math.round(score / 10)).padEnd(10, '░');
-    const verdict = score > 80 ? '💞 A perfect match!' : score > 60 ? '💖 Pretty good!' : score > 40 ? '💛 Could work…' : score > 20 ? '💔 Not looking great.' : '🥶 Absolutely not.';
-    message.reply({ embeds: [new EmbedBuilder().setColor(0xff66aa).setTitle('💘 Ship-o-meter').setDescription(`**${a.username}** ❤️ **${b.username}**\n\n\`${bar}\` **${score}%**\n${verdict}`)] });
+
+    // 🤫 secret rig check — set with -shiprig (owner only, via -cmdsowner)
+    const pairKey = [a.id, b.id].sort().join('-');
+    const rigged  = await db.get(`shiprig.${message.guild.id}.${pairKey}`);
+    const score   = rigged ?? Math.floor(Math.random() * 101);
+
+    // ship name: first half of one name + second half of the other
+    const shipName = (a.username.slice(0, Math.ceil(a.username.length / 2)) +
+                      b.username.slice(Math.floor(b.username.length / 2))).slice(0, 32);
+
+    // fancy heart bar
+    const filled = Math.round(score / 10);
+    const heart  = score >= 90 ? '💖' : score >= 70 ? '❤️' : score >= 50 ? '🧡' : score >= 30 ? '💛' : '🖤';
+    const bar    = heart.repeat(filled) + '🤍'.repeat(10 - filled);
+
+    const verdict =
+      score === 100 ? '💍 SOULMATES. Book the venue.' :
+      score >= 90   ? '💖 Written in the stars!' :
+      score >= 70   ? '💕 There\'s definitely something here…' :
+      score >= 50   ? '🧡 Could work with some effort!' :
+      score >= 30   ? '💛 Eh… maybe as friends.' :
+      score >= 10   ? '💔 The vibes are off.' :
+      score === 0   ? '☠️ Restraining order territory.' :
+                      '🥶 Absolutely not.';
+
+    message.reply({ embeds: [new EmbedBuilder()
+      .setColor(score >= 70 ? 0xff4d8d : score >= 40 ? 0xffaa33 : 0x8899aa)
+      .setTitle('💘 Ship-o-meter 💘')
+      .setDescription(`✨ **${a.username}** ✕ **${b.username}** ✨\n\n> 💞 Ship name: **${shipName}**\n\n${bar}\n\n# ${score}%\n${verdict}`)
+      .setFooter({ text: 'Cupid has spoken 🏹' })] });
   }
 
   // ── -mock ──────────────────────────────────────────────────────
@@ -1917,6 +1943,36 @@ client.on('messageCreate', async message => {
     if (!ch) return message.reply('❌ Usage: `-modlog #channel` or `-modlog disable`');
     await db.set(`modlog.${message.guild.id}`, ch.id);
     return message.reply(`✅ Mod logs → ${ch}. Logging: message deletes/edits, joins, leaves, bans, and automod actions.`);
+  }
+
+  // ── -shiprig (secret, owner only) ──────────────────────────────
+  else if (cmd === 'shiprig') {
+    if (message.author.id !== message.guild.ownerId) return; // silent — it's a secret
+    await message.delete().catch(() => {});
+    const sub = args[0]?.toLowerCase();
+
+    if (sub === 'clear') {
+      const users = [...message.mentions.users.values()];
+      if (users.length >= 1) {
+        const a = users[0], b = users[1] ?? message.author;
+        await db.delete(`shiprig.${message.guild.id}.${[a.id, b.id].sort().join('-')}`);
+      } else {
+        await db.delete(`shiprig.${message.guild.id}`); // clear all rigs
+      }
+      return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0x00cc44).setDescription('🤫 Rig(s) cleared.')] })
+        .then(m => setTimeout(() => m.delete().catch(() => {}), 4000));
+    }
+
+    const users = [...message.mentions.users.values()];
+    const score = parseInt(args.find(x => /^\d{1,3}$/.test(x)));
+    if (users.length < 1 || isNaN(score) || score < 0 || score > 100) {
+      return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff4444).setDescription('🤫 Usage: `-shiprig @a @b <0-100>` • `-shiprig @a <0-100>` (pairs with you) • `-shiprig clear [@a @b]`')] })
+        .then(m => setTimeout(() => m.delete().catch(() => {}), 8000));
+    }
+    const a = users[0], b = users[1] ?? message.author;
+    await db.set(`shiprig.${message.guild.id}.${[a.id, b.id].sort().join('-')}`, score);
+    return message.channel.send({ content: `<@${message.author.id}>`, embeds: [new EmbedBuilder().setColor(0xff66aa).setDescription(`🤫 Rigged! **${a.username}** ✕ **${b.username}** will always roll **${score}%**.\nUndo with \`-shiprig clear @a @b\`.`)] })
+      .then(m => setTimeout(() => m.delete().catch(() => {}), 8000));
   }
 
   // ── -say ──────────────────────────────────────────────────────
