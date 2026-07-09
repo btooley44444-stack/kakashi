@@ -296,7 +296,15 @@ const POLL_EMOJIS = ['🇦', '🇧', '🇨', '🇩', '🇪', '🇫', '🇬', '�
 //  Falls back to a text embed if the library isn't installed.
 // ─────────────────────────────────────────────
 let canvasLib = null;
-try { canvasLib = require('@napi-rs/canvas'); } catch { console.warn('[ship] @napi-rs/canvas not installed — ship cards will be text-only'); }
+let shipFontLoaded = false;
+try {
+  canvasLib = require('@napi-rs/canvas');
+  // Railway containers have no system fonts, so bundle one (font.ttf next to bot.js)
+  try {
+    canvasLib.GlobalFonts.registerFromPath(require('path').join(__dirname, 'font.ttf'), 'ShipFont');
+    shipFontLoaded = true;
+  } catch { console.warn('[ship] font.ttf not found — % text on ship cards may not render'); }
+} catch { console.warn('[ship] @napi-rs/canvas not installed — ship cards will be text-only'); }
 
 function roundRect(ctx, x, y, w, h, r) {
   ctx.beginPath();
@@ -371,7 +379,7 @@ async function makeShipCard(a, b, score) {
     ctx.fillStyle = grad;
     ctx.fill();
   }
-  ctx.font = 'bold 22px sans-serif';
+  ctx.font = 'bold 22px ShipFont, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillStyle = '#ffffff';
@@ -1760,7 +1768,7 @@ client.on('messageCreate', async message => {
           embeds: [new EmbedBuilder()
             .setColor(embedColor)
             .setTitle('💘 Ship-o-meter 💘')
-            .setDescription(`✨ **${a.username}** ✕ **${b.username}** ✨\n💞 Ship name: **${shipName}**\n\n**${verdict}**`)
+            .setDescription(`✨ **${a.username}** ✕ **${b.username}** ✨\n💞 Ship name: **${shipName}**${shipFontLoaded ? '' : `\n\n**${score}%**`}\n\n**${verdict}**`)
             .setImage('attachment://ship.png')
             .setFooter({ text: 'Cupid has spoken 🏹' })],
           files: [card],
